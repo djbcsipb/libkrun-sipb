@@ -422,6 +422,13 @@ impl TsiStreamProxy {
         };
     }
 
+    fn get_evset(&self) -> EventSet {
+        let mut evset = EventSet::empty();
+        evset.set(EventSet::IN, self.status == ProxyStatus::Connected);
+        evset.set(EventSet::OUT, !self.pending_tx.is_empty());
+        evset
+    }
+
     fn try_send(&mut self, update: &mut ProxyUpdate) {
         if !self.pending_tx.is_empty() {
             #[cfg(target_os = "macos")]
@@ -466,12 +473,7 @@ impl TsiStreamProxy {
             update.signal_queue = true;
         }
 
-        let evset = if self.pending_tx.is_empty() {
-            EventSet::IN
-        } else {
-            EventSet::IN | EventSet::OUT
-        };
-        update.polling = Some((self.id, self.fd.as_raw_fd(), evset));
+        update.polling = Some((self.id, self.fd.as_raw_fd(), self.get_evset()));
     }
 
     fn get_addr_len(&self, addr: &SockaddrStorage) -> Option<u32> {
@@ -718,7 +720,7 @@ impl Proxy for TsiStreamProxy {
         self.status = ProxyStatus::Connected;
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((self.id, self.fd.as_raw_fd(), self.get_evset())),
             ..Default::default()
         }
     }
@@ -751,7 +753,7 @@ impl Proxy for TsiStreamProxy {
         self.switch_to_connected();
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((self.id, self.fd.as_raw_fd(), self.get_evset())),
             push_accept: Some((self.id, self.parent_id)),
             ..Default::default()
         }
@@ -865,7 +867,7 @@ impl Proxy for TsiStreamProxy {
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.polling = Some((self.id(), self.fd.as_raw_fd(), self.get_evset()));
                 }
             } else if self.status == ProxyStatus::Listening
                 || self.status == ProxyStatus::WaitingOnAccept
@@ -895,7 +897,9 @@ impl Proxy for TsiStreamProxy {
                 // Stop listening for events in the TCP socket until we receive
                 // OP_REQUEST and the vsock transport is fully established.
                 update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
-            } else if self.status == ProxyStatus::Connected {
+            } else if self.status == ProxyStatus::Connected
+                || self.status == ProxyStatus::WaitingCreditUpdate
+            {
                 self.try_send(&mut update);
             } else {
                 debug!("EventSet::OUT while not connecting");
