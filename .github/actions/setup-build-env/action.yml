@@ -69,6 +69,7 @@ runs:
           clang-format \
           libclang-dev \
           meson \
+          musl-tools \
           ninja-build \
           python3-yaml \
           gcc-mingw-w64-x86-64
