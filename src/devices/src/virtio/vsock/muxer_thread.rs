@@ -1,18 +1,22 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(windows)]
+use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
-use super::muxer_rxq::MuxerRxQ;
+use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
+use super::packet::VsockPacket;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
 use crate::virtio::vsock::defs;
-use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
+use crate::virtio::vsock::unix_proxy::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
 use rand::{RngExt, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -63,6 +67,31 @@ impl MuxerThread {
             .unwrap();
     }
 
+    fn drain_rxq(&self) -> bool {
+        let mut queue = self.queue.lock().unwrap();
+        let mut rxq = self.rxq.lock().unwrap();
+        let mut drained = false;
+
+        while let Some(rx) = rxq.pop() {
+            if let Some(head) = queue.pop(&self.mem) {
+                if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
+                    rx_to_pkt(self.cid, rx, &mut pkt);
+                    if let Err(e) =
+                        queue.add_used(&self.mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                    {
+                        error!("failed to add used elements to the queue: {e:?}");
+                    }
+                    drained = true;
+                }
+            } else {
+                rxq.push(rx);
+                break;
+            }
+        }
+
+        drained
+    }
+
     fn send_credit_request(&self, credit_rx: MuxerRx) {
         debug!("send_credit_request");
         push_packet(self.cid, credit_rx, &self.rxq, &self.queue, &self.mem);
@@ -70,13 +99,28 @@ impl MuxerThread {
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
         debug!("update_polling id={id} fd={fd:?} evset={evset:?}");
-        let _ = self
-            .epoll
-            .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
-        if !evset.is_empty() {
+        #[cfg(unix)]
+        {
             let _ = self
                 .epoll
-                .ctl(ControlOperation::Add, fd, &EpollEvent::new(evset, id));
+                .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
+            if !evset.is_empty() {
+                let _ = self
+                    .epoll
+                    .ctl(ControlOperation::Add, fd, &EpollEvent::new(evset, id));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let sock = fd as windows_sys::Win32::Networking::WinSock::SOCKET;
+            let _ = self
+                .epoll
+                .ctl_socket(ControlOperation::Delete, sock, &EpollEvent::default());
+            if !evset.is_empty() {
+                let _ =
+                    self.epoll
+                        .ctl_socket(ControlOperation::Add, sock, &EpollEvent::new(evset, id));
+            }
         }
     }
 
@@ -149,7 +193,7 @@ impl MuxerThread {
         }
     }
 
-    fn create_lisening_ipc_sockets(&self) {
+    fn create_listening_ipc_sockets(&self) {
         for (port, (path, do_listen)) in &self.unix_ipc_port_map {
             if !do_listen {
                 continue;
@@ -174,22 +218,32 @@ impl MuxerThread {
 
     fn work(mut self) {
         let mut thread_rng = rng();
-        self.create_lisening_ipc_sockets();
+        self.create_listening_ipc_sockets();
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
+            if self.drain_rxq() {
+                self.interrupt.signal_used_queue();
+            }
+
             match self
                 .epoll
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())
             {
                 Ok(ev_cnt) => {
                     for ev in &epoll_events[0..ev_cnt] {
-                        debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
+                        debug!("Event: ev.data={} ev.fd={:?}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();
-                            proxy.process_event(evset)
+                            let mut update = proxy.process_event(evset);
+                            // Credit updates must not rearm polling before this
+                            // event's decision to stop polling has been applied.
+                            if let Some((id, fd, events)) = update.polling.take() {
+                                self.update_polling(id, fd, events);
+                            }
+                            update
                         });
 
                         if let Some(update) = update {

@@ -4,9 +4,7 @@
 use vm_memory::GuestMemoryMmap;
 
 use super::super::gdt::SegmentDescriptor;
-use super::super::layout::{
-    AP_TRAMPOLINE_START, BOOT_STACK_POINTER, RESET_VECTOR_SEV_AP, ZERO_PAGE_START,
-};
+use super::super::layout::{BOOT_STACK_POINTER, ZERO_PAGE_START};
 use super::super::regs::{
     EFER_LMA, EFER_LME, Error, X86_CR0_PE, compute_page_tables, compute_segments,
 };
@@ -21,28 +19,87 @@ type Result<T> = std::result::Result<T, Error>;
 /// * `vcpu` - Structure for the VCPU that holds the WHP VCPU.
 /// * `boot_ip` - Starting instruction pointer.
 pub fn setup_regs(vcpu: &whp::WhpVcpu, boot_ip: u64) -> Result<()> {
-    if vcpu.index() == 0 {
-        vcpu.set_registers64([
-            (WHvX64RegisterRflags, 0x0000_0000_0000_0002u64),
-            (WHvX64RegisterRip, boot_ip),
-            (WHvX64RegisterRsp, BOOT_STACK_POINTER),
-            (WHvX64RegisterRbp, BOOT_STACK_POINTER),
-            (WHvX64RegisterRsi, ZERO_PAGE_START),
-        ])
-        .map_err(Error::SetWhpRegisters)
-    } else {
-        let rip = if cfg!(feature = "tee") {
-            RESET_VECTOR_SEV_AP
-        } else {
-            AP_TRAMPOLINE_START
-        };
+    vcpu.set_registers64([
+        (WHvX64RegisterRflags, 0x0000_0000_0000_0002u64),
+        (WHvX64RegisterRip, boot_ip),
+        (WHvX64RegisterRsp, BOOT_STACK_POINTER),
+        (WHvX64RegisterRbp, BOOT_STACK_POINTER),
+        (WHvX64RegisterRsi, ZERO_PAGE_START),
+    ])
+    .map_err(Error::SetWhpRegisters)
+}
 
-        vcpu.set_registers64([
-            (WHvX64RegisterRflags, 0x0000_0000_0000_0002u64),
-            (WHvX64RegisterRip, rip),
-        ])
-        .map_err(Error::SetWhpRegisters)
-    }
+/// Configure the architectural reset state used to enter PC firmware.
+///
+/// Sets registers to the standard x86 real-mode CPU reset state as defined by the
+/// Intel 64 and IA-32 Architectures Software Developer's Manual (Volume 3A,
+/// Chapter "Processor State After Reset") and the AMD64 Architecture Programmer's Manual.
+///
+/// This setup mirrors standard VMM reset implementations, such as QEMU's reset logic in:
+/// `target/i386/cpu.c` -> `x86_cpu_reset_hold()`
+pub fn setup_firmware_regs(vcpu: &whp::WhpVcpu, boot_ip: u64) -> Result<()> {
+    let to_reg64 = |val: u64| -> WHV_REGISTER_VALUE {
+        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
+        v.Reg64 = val;
+        v
+    };
+
+    let to_segment = |base: u64, selector: u16, attributes: u16| -> WHV_REGISTER_VALUE {
+        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
+        let segment = unsafe { &mut v.Segment };
+        segment.Base = base;
+        segment.Limit = 0xffff;
+        segment.Selector = selector;
+        segment.Anonymous.Anonymous._bitfield = attributes;
+        v
+    };
+
+    let to_table = || -> WHV_REGISTER_VALUE {
+        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
+        let table = unsafe { &mut v.Table };
+        table.Base = 0;
+        table.Limit = 0xffff;
+        v
+    };
+
+    let data_segment = to_segment(0, 0, 0x0093);
+
+    vcpu.set_registers([
+        (WHvX64RegisterRax, to_reg64(0)),
+        (WHvX64RegisterRbx, to_reg64(0)),
+        (WHvX64RegisterRcx, to_reg64(0)),
+        (WHvX64RegisterRdx, to_reg64(0x600)),
+        (WHvX64RegisterRsp, to_reg64(0)),
+        (WHvX64RegisterRbp, to_reg64(0)),
+        (WHvX64RegisterRsi, to_reg64(0)),
+        (WHvX64RegisterRdi, to_reg64(0)),
+        (WHvX64RegisterR8, to_reg64(0)),
+        (WHvX64RegisterR9, to_reg64(0)),
+        (WHvX64RegisterR10, to_reg64(0)),
+        (WHvX64RegisterR11, to_reg64(0)),
+        (WHvX64RegisterR12, to_reg64(0)),
+        (WHvX64RegisterR13, to_reg64(0)),
+        (WHvX64RegisterR14, to_reg64(0)),
+        (WHvX64RegisterR15, to_reg64(0)),
+        (WHvX64RegisterRip, to_reg64(boot_ip)),
+        (WHvX64RegisterRflags, to_reg64(0x2)),
+        (WHvX64RegisterEs, data_segment),
+        (WHvX64RegisterCs, to_segment(0xffff_0000, 0xf000, 0x009b)),
+        (WHvX64RegisterSs, data_segment),
+        (WHvX64RegisterDs, data_segment),
+        (WHvX64RegisterFs, data_segment),
+        (WHvX64RegisterGs, data_segment),
+        (WHvX64RegisterLdtr, to_segment(0, 0, 0x0082)),
+        (WHvX64RegisterTr, to_segment(0, 0, 0x008b)),
+        (WHvX64RegisterIdtr, to_table()),
+        (WHvX64RegisterGdtr, to_table()),
+        (WHvX64RegisterCr0, to_reg64(0x6000_0010)),
+        (WHvX64RegisterCr2, to_reg64(0)),
+        (WHvX64RegisterCr3, to_reg64(0)),
+        (WHvX64RegisterCr4, to_reg64(0)),
+        (WHvX64RegisterEfer, to_reg64(0)),
+    ])
+    .map_err(Error::SetWhpRegisters)
 }
 
 /// Configures the segment registers and system page tables for a given CPU.
@@ -52,13 +109,6 @@ pub fn setup_regs(vcpu: &whp::WhpVcpu, boot_ip: u64) -> Result<()> {
 /// * `mem` - The memory that will be passed to the guest.
 /// * `vcpu` - Structure for the VCPU that holds the WHP VCPU.
 pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
-    if vcpu.index() != 0 {
-        if cfg!(feature = "tee") {
-            return Ok(());
-        }
-        return setup_ap_segments(vcpu);
-    }
-
     let segs = compute_segments(mem, false)?;
     let pt = compute_page_tables(mem)?;
 
@@ -114,27 +164,13 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
     .map_err(Error::SetWhpRegisters)
 }
 
-/// Reset CS.base to 0 for an AP vCPU so that RIP addresses land in low
-/// memory rather than at the default reset CS.base of 0xFFFF_0000.
-/// All other segment registers and control registers stay at their
-/// power-on defaults (real mode).
-fn setup_ap_segments(vcpu: &whp::WhpVcpu) -> Result<()> {
-    let [mut value] = vcpu
-        .get_registers([WHvX64RegisterCs])
-        .map_err(Error::GetWhpRegisters)?;
-    value.Segment.Base = 0;
-    value.Segment.Selector = 0;
-    vcpu.set_registers([(WHvX64RegisterCs, value)])
-        .map_err(Error::SetWhpRegisters)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::super::regs::{BOOT_GDT_OFFSET, BOOT_IDT_OFFSET, X86_CR0_PG, X86_CR4_PAE};
     use super::*;
     use std::ffi::c_void;
     use std::sync::Arc;
-    use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
     use whp::{WhpVcpu, WhpVm};
 
     const GUEST_MEM_SIZE: usize = 0x10000;
@@ -183,24 +219,16 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_regs_ap() {
+    fn test_ap_starts_suspended() {
         let vm = Arc::new(WhpVm::new(2).unwrap());
         let _bsp = WhpVcpu::new(vm.clone(), 0).unwrap();
         let ap = WhpVcpu::new(vm.clone(), 1).unwrap();
 
-        setup_regs(&ap, 0).unwrap();
-
-        let [rflags, rip] = ap
-            .get_registers64([WHvX64RegisterRflags, WHvX64RegisterRip])
+        let [activity] = ap
+            .get_registers64([WHvRegisterInternalActivityState])
             .unwrap();
 
-        assert_eq!(rflags & 0x2, 0x2);
-        let expected_rip = if cfg!(feature = "tee") {
-            RESET_VECTOR_SEV_AP
-        } else {
-            AP_TRAMPOLINE_START
-        };
-        assert_eq!(rip, expected_rip);
+        assert_eq!(activity & 1, 1);
     }
 
     #[test]
@@ -246,19 +274,5 @@ mod tests {
         for i in 0..512u64 {
             assert_eq!((i << 21) + 0x83, read_u64(0xb000 + (i * 8)));
         }
-    }
-
-    #[test]
-    fn test_setup_ap_segments() {
-        let vm = Arc::new(WhpVm::new(2).unwrap());
-        let _bsp = WhpVcpu::new(vm.clone(), 0).unwrap();
-        let ap = WhpVcpu::new(vm.clone(), 1).unwrap();
-
-        setup_ap_segments(&ap).unwrap();
-
-        let [cs_val] = ap.get_registers([WHvX64RegisterCs]).unwrap();
-        let cs = unsafe { cs_val.Segment };
-        assert_eq!(cs.Base, 0);
-        assert_eq!(cs.Selector, 0);
     }
 }

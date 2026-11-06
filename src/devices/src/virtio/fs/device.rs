@@ -2,6 +2,7 @@
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -21,9 +22,8 @@ use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
-use super::{defs, defs::uapi};
+use super::{CachePolicy, PermissionSemantics, defs, defs::uapi};
 use crate::virtio::InterruptTransport;
-use crate::virtio::passthrough::PermissionSemantics;
 
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -52,7 +52,7 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
-    virtual_entries: Vec<VirtualDirEntry>,
+    virtual_entries: Vec<VirtualDirEntry<'static>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
@@ -67,7 +67,7 @@ impl Fs {
         shared_dir: Option<String>,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
-        virtual_entries: Vec<VirtualDirEntry>,
+        virtual_entries: Vec<VirtualDirEntry<'static>>,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -76,24 +76,14 @@ impl Fs {
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
-        let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
-            // As uid/gid are context-dependent, attributes can't be cached.
-            Duration::from_secs(0)
-        } else {
-            // The value defined as default in virtio-fs.
-            Duration::from_secs(5)
-        };
-
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
-            semantics,
-            attr_timeout,
             ..Default::default()
         });
 
         let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
 
-        Ok(Fs {
+        let mut fs = Fs {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
@@ -108,7 +98,11 @@ impl Fs {
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
-        })
+        };
+        if !fs.set_permission_semantics(semantics) && fs.passthrough_cfg.is_some() {
+            return Err(FsError::UnsupportedPermissionSemantics);
+        }
+        Ok(fs)
     }
 
     pub fn id(&self) -> &str {
@@ -117,6 +111,71 @@ impl Fs {
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
         self.shm_region = Some(shm_region);
+    }
+
+    pub fn set_permission_semantics(&mut self, semantics: PermissionSemantics) -> bool {
+        if cfg!(target_os = "linux") && matches!(semantics, PermissionSemantics::LinuxSimplified) {
+            return false;
+        }
+        if cfg!(not(target_os = "macos"))
+            && matches!(semantics, PermissionSemantics::LinuxSimplifiedFixedOwner)
+        {
+            return false;
+        }
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        let complete = matches!(semantics, PermissionSemantics::LinuxComplete);
+        cfg.semantics = semantics;
+        // Requester ownership is context-dependent, so attributes cannot be cached.
+        cfg.attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(5)
+        };
+        cfg.xattr = complete;
+        #[cfg(target_os = "macos")]
+        {
+            cfg.fixed_owner = None;
+        }
+        self.allow_idmap = complete;
+        true
+    }
+
+    /// Sets the owner that `LinuxSimplifiedFixedOwner` reports; fails in any other mode.
+    pub fn set_fixed_owner(&mut self, uid: u32, gid: u32) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(cfg) = self.passthrough_cfg.as_mut()
+            && matches!(
+                cfg.semantics,
+                PermissionSemantics::LinuxSimplifiedFixedOwner
+            )
+        {
+            cfg.fixed_owner = Some((uid, gid));
+            return true;
+        }
+        let _ = (uid, gid);
+        false
+    }
+
+    /// Whether the device is in `LinuxSimplifiedFixedOwner` mode with no owner set.
+    pub fn lacks_fixed_owner(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(cfg) = self.passthrough_cfg.as_ref() {
+            return matches!(
+                cfg.semantics,
+                PermissionSemantics::LinuxSimplifiedFixedOwner
+            ) && cfg.fixed_owner.is_none();
+        }
+        false
+    }
+
+    pub fn set_cache_policy(&mut self, policy: CachePolicy) -> bool {
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        cfg.cache_policy = policy;
+        true
     }
 
     pub fn set_export_table(&mut self, export_table: ExportTable) -> u64 {
@@ -132,6 +191,14 @@ impl Fs {
         cfg.export_table = Some(export_table);
 
         cfg.export_fsid
+    }
+
+    pub fn add_virtual_entry(&mut self, entry: VirtualDirEntry<'static>) {
+        self.virtual_entries.push(entry);
+    }
+
+    pub fn set_exit_code(&mut self, exit_code: Arc<AtomicI32>) {
+        self.exit_code = exit_code;
     }
 
     #[cfg(target_os = "macos")]
@@ -163,6 +230,10 @@ impl VirtioDevice for Fs {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioFsConfig>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
@@ -248,5 +319,213 @@ impl VirtioDevice for Fs {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filesystem(shared_dir: Option<String>) -> Fs {
+        Fs::new(
+            "shared".to_owned(),
+            PermissionSemantics::LinuxComplete,
+            shared_dir,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn permission_changes_update_ownership_caching_and_idmap_support() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        for semantics in [
+            PermissionSemantics::LinuxSimplified,
+            PermissionSemantics::LinuxComplete,
+        ] {
+            assert!(fs.set_permission_semantics(semantics));
+            let cfg = fs.passthrough_cfg.as_ref().unwrap();
+            if matches!(semantics, PermissionSemantics::LinuxComplete) {
+                assert!(matches!(cfg.semantics, PermissionSemantics::LinuxComplete));
+                assert_eq!(cfg.attr_timeout, Duration::from_secs(5));
+                assert!(cfg.xattr);
+                assert!(fs.allow_idmap);
+            } else {
+                assert!(matches!(
+                    cfg.semantics,
+                    PermissionSemantics::LinuxSimplified
+                ));
+                assert_eq!(cfg.attr_timeout, Duration::ZERO);
+                assert!(!cfg.xattr);
+                assert!(!fs.allow_idmap);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fixed_owner_semantics_keep_attributes_cacheable() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.lacks_fixed_owner());
+        assert!(fs.set_fixed_owner(1234, 5678));
+        assert!(!fs.lacks_fixed_owner());
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert_eq!(cfg.fixed_owner, Some((1234, 5678)));
+        assert_eq!(cfg.attr_timeout, Duration::from_secs(5));
+        assert!(!cfg.xattr);
+        assert!(!fs.allow_idmap);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fixed_owner_is_rejected_in_other_semantics() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        for semantics in [
+            PermissionSemantics::LinuxComplete,
+            PermissionSemantics::LinuxSimplified,
+        ] {
+            assert!(fs.set_permission_semantics(semantics));
+            assert!(!fs.set_fixed_owner(1234, 5678));
+            assert!(!fs.lacks_fixed_owner());
+            assert_eq!(fs.passthrough_cfg.as_ref().unwrap().fixed_owner, None);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn changing_semantics_clears_the_fixed_owner() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.set_fixed_owner(1234, 5678));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.lacks_fixed_owner());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn fixed_owner_semantics_are_rejected_off_macos() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(!fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(!fs.set_fixed_owner(1234, 5678));
+        assert!(!fs.lacks_fixed_owner());
+    }
+
+    #[test]
+    fn null_filesystems_reject_permission_changes() {
+        let mut fs = filesystem(None);
+        assert!(!fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+        assert!(fs.allow_idmap);
+        assert!(fs.passthrough_cfg.is_none());
+    }
+
+    #[test]
+    fn cache_policy_changes_preserve_permission_options() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().cache_policy,
+            CachePolicy::Auto
+        );
+        let attr_timeout = Duration::from_millis(123);
+        fs.passthrough_cfg.as_mut().unwrap().attr_timeout = attr_timeout;
+
+        for policy in [CachePolicy::Never, CachePolicy::Always, CachePolicy::Auto] {
+            assert!(fs.set_cache_policy(policy));
+            let cfg = fs.passthrough_cfg.as_ref().unwrap();
+            assert_eq!(cfg.cache_policy, policy);
+            assert!(matches!(cfg.semantics, PermissionSemantics::LinuxComplete));
+            assert_eq!(cfg.attr_timeout, attr_timeout);
+            assert!(cfg.xattr);
+            assert!(fs.allow_idmap);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn permission_changes_preserve_cache_policy() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_cache_policy(CachePolicy::Always));
+
+        for semantics in [
+            PermissionSemantics::LinuxSimplified,
+            PermissionSemantics::LinuxComplete,
+        ] {
+            assert!(fs.set_permission_semantics(semantics));
+            assert_eq!(
+                fs.passthrough_cfg.as_ref().unwrap().cache_policy,
+                CachePolicy::Always
+            );
+        }
+    }
+
+    #[test]
+    fn null_filesystems_reject_cache_policy_changes() {
+        let mut fs = filesystem(None);
+        for policy in [CachePolicy::Never, CachePolicy::Auto, CachePolicy::Always] {
+            assert!(!fs.set_cache_policy(policy));
+        }
+        assert!(fs.allow_idmap);
+        assert!(fs.passthrough_cfg.is_none());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn constructors_apply_the_selected_permission_semantics() {
+        let fs = Fs::new(
+            "shared".to_owned(),
+            PermissionSemantics::LinuxSimplified,
+            Some("/".to_owned()),
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert!(matches!(
+            cfg.semantics,
+            PermissionSemantics::LinuxSimplified
+        ));
+        assert_eq!(cfg.attr_timeout, Duration::ZERO);
+        assert!(!cfg.xattr);
+        assert!(!fs.allow_idmap);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unsupported_permission_changes_preserve_configuration() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        let attr_timeout = Duration::from_millis(123);
+        fs.passthrough_cfg.as_mut().unwrap().attr_timeout = attr_timeout;
+
+        assert!(!fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert!(matches!(cfg.semantics, PermissionSemantics::LinuxComplete));
+        assert_eq!(cfg.attr_timeout, attr_timeout);
+        assert!(cfg.xattr);
+        assert!(fs.allow_idmap);
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxComplete));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn constructors_reject_unsupported_permission_semantics() {
+        let result = Fs::new(
+            "shared".to_owned(),
+            PermissionSemantics::LinuxSimplified,
+            Some("/".to_owned()),
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(FsError::UnsupportedPermissionSemantics)
+        ));
     }
 }

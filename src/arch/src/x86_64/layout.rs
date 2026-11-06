@@ -22,11 +22,12 @@ pub const INITRD_SEV_START: u64 = 0xa00000;
 /// Start of the high memory.
 pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
 
-// Typically, on x86 systems 16 IRQs are used (0-15).
+// The I/O APIC has 24 pins (0-23). ISA IRQs 0-4 are reserved for
+// legacy devices, leaving GSIs 5-23 for virtio-mmio devices.
 /// First usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_BASE: u32 = 5;
 /// Last usable IRQ ID for virtio device interrupts on x86_64.
-pub const IRQ_MAX: u32 = 15;
+pub const IRQ_MAX: u32 = 23;
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
@@ -69,12 +70,6 @@ pub const RESET_VECTOR: u64 = 0xfff0;
 pub const RESET_VECTOR: u64 = 0xffff_fff0;
 pub const RESET_VECTOR_SEV_AP: u64 = 0xfff3;
 
-/// Address of the AP idle trampoline (`cli; hlt; jmp` loop) used during
-/// SMP boot on WHP. APs park here in real mode until the BSP sends
-/// INIT + SIPI through the emulated local APIC.
-#[cfg(target_os = "windows")]
-pub const AP_TRAMPOLINE_START: u64 = 0x1000;
-
 /// The address to load the firmware, if present.
 pub const FIRMWARE_START: u64 = 0xffff_0000;
 
@@ -85,3 +80,13 @@ pub const FIRMWARE_SIZE: u64 = 65536;
 pub const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 pub const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
 pub const MMIO_MEM_START: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
+
+/// Start of the PCI Express ECAM window for bus 0.
+pub const PCI_ECAM_START: u64 = 0xe000_0000;
+/// ECAM exposes 4 KiB of configuration space for each of 256 PCI buses.
+/// This VM exposes bus 0 only.
+pub const PCI_ECAM_SIZE: u64 = 1 << 20;
+/// Start of the PCI memory BAR allocation window.
+pub const PCI_BAR_START: u64 = PCI_ECAM_START + PCI_ECAM_SIZE;
+/// Exclusive end of the PCI memory BAR allocation window, below the IOAPIC.
+pub const PCI_BAR_END: u64 = 0xfec0_0000;

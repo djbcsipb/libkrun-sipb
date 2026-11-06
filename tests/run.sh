@@ -34,6 +34,12 @@ fi
 if [ "$OS" = "Darwin" ]; then
 	echo "Cross-compiling guest-agent for $GUEST_TARGET"
 
+	# Cross-linker for musl targets on macOS (brew install llvm for lld).
+	export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="/usr/bin/clang"
+	export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="\
+		-C link-arg=-target -C link-arg=aarch64-linux-gnu \
+		-C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug"
+
 	# e2fsprogs is keg-only on macOS; add it to PATH for mke2fs.
 	if [ -d "/opt/homebrew/opt/e2fsprogs/sbin" ]; then
 		export PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
@@ -41,7 +47,12 @@ if [ "$OS" = "Darwin" ]; then
 fi
 
 cargo build --target=$GUEST_TARGET -p guest-agent
-cargo build -p runner
+
+RUNNER_FEATURES=""
+if [ "${KRUN_TEST_FFI}" = "1" ]; then
+	RUNNER_FEATURES="--no-default-features --features ffi"
+fi
+cargo build -p runner $RUNNER_FEATURES
 
 # On macOS, the runner needs entitlements to use Hypervisor.framework
 if [ "$OS" = "Darwin" ]; then
@@ -52,7 +63,7 @@ export KRUN_TEST_GUEST_AGENT_PATH="target/$GUEST_TARGET/debug/guest-agent"
 
 # --- FreeBSD guest support ---
 FREEBSD_SYSROOT="../freebsd-sysroot"
-FREEBSD_INIT="../init/init-freebsd"
+FREEBSD_INIT="../init/init-binary/init-freebsd"
 
 RUST_NIGHTLY="nightly-2026-01-25"
 
@@ -145,7 +156,7 @@ if [ -f "${FREEBSD_SYSROOT}/.sysroot_ready" ] && [ -f "${FREEBSD_INIT}" ]; then
 	echo "FreeBSD test rootfs ISO: ${FREEBSD_ISO_PATH}"
 	export KRUN_TEST_FREEBSD_ISO_PATH="${FREEBSD_ISO_PATH}"
 else
-	echo "FreeBSD sysroot or init/init-freebsd not found; FreeBSD tests will be skipped."
+	echo "FreeBSD sysroot or init/init-binary/init-freebsd not found; FreeBSD tests will be skipped."
 	echo "(Run 'make' with BUILD_BSD_INIT=1 in the libkrun root to build FreeBSD assets.)"
 fi
 

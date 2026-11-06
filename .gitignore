@@ -7,7 +7,10 @@ __pycache__
 *.pyc
 *~
 /libkrun.pc
-init/nitro/init
+/libkrun_init.pc
+init/init
+init/init-binary/init-*
+init/aws-nitro/init
 examples/chroot_vm
 examples/launch-tee
 examples/boot_efi

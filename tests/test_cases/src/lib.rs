@@ -1,13 +1,58 @@
+#[cfg(all(feature = "static-linking", feature = "dynamic-linking"))]
+compile_error!("Cannot enable both static-linking and dynamic-linking");
+
+#[cfg(feature = "dynamic-linking")]
+extern crate krun_cdylib as krun;
+#[cfg(feature = "static-linking")]
+extern crate krun_init_blob as krun_init;
+#[cfg(feature = "dynamic-linking")]
+extern crate krun_init_cdylib as krun_init;
+
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
+#[cfg(any(feature = "guest", target_os = "macos"))]
 mod test_vm_pause;
+#[cfg(any(feature = "guest", target_os = "macos"))]
 use test_vm_pause::TestVmPause;
+
+mod test_acpi_smp;
+use test_acpi_smp::TestAcpiSmp;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod test_virtio_blk_irq;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use test_virtio_blk_irq::TestVirtioBlkIrq;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_vsock_guest_connect;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_vsock_guest_connect::TestVsockGuestConnect;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_guest_reconnect;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_guest_reconnect::TestVsockGuestReconnect;
+
+#[cfg(target_os = "linux")]
+mod test_vsock_host_close;
+#[cfg(target_os = "linux")]
+use test_vsock_host_close::TestVsockHostClose;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_host_connect_refused;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_host_connect_refused::TestVsockHostConnectRefused;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_guest_connect_refused;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_guest_connect_refused::TestVsockGuestConnectRefused;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_guest_connect_emfile;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_guest_connect_emfile::TestVsockGuestConnectEmfile;
 
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
@@ -15,8 +60,16 @@ use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 mod test_tsi_tcp_guest_listen;
 use test_tsi_tcp_guest_listen::TestTsiTcpGuestListen;
 
+mod test_tsi_tcp_half_close;
+use test_tsi_tcp_half_close::TestTsiTcpHalfClose;
+
+#[cfg(target_os = "linux")]
+mod test_tsi_unix_host_close;
+#[cfg(target_os = "linux")]
+use test_tsi_unix_host_close::TestTsiUnixHostClose;
+
 pub(crate) mod test_net;
-use test_net::TestNet;
+use test_net::{TestNet, TestTapRenew};
 
 mod test_net_perf;
 use test_net_perf::TestNetPerf;
@@ -42,6 +95,21 @@ use test_pjdfstest::TestPjdfstest;
 mod test_virtiofs_misc;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_misc::TestVirtioFsMisc;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_fixed_owner;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_fixed_owner::TestVirtiofsFixedOwner;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod test_virtio_pci;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use test_virtio_pci::TestVirtioPci;
+
+#[cfg(target_os = "linux")]
+mod test_virtio_rtc;
+#[cfg(target_os = "linux")]
+use test_virtio_rtc::TestVirtioRtc;
 
 pub enum TestOutcome {
     Pass,
@@ -79,7 +147,6 @@ impl ShouldRun {
 }
 
 pub fn test_cases() -> Vec<TestCase> {
-    // Register your test here:
     vec![
         TestCase::new(
             "configure-vm-1cpu-256MiB",
@@ -95,9 +162,40 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
+        #[cfg(any(feature = "guest", target_os = "macos"))]
         TestCase::new("vm-pause", Box::new(TestVmPause)),
+        TestCase::new("acpi-smp-4cpu", Box::new(TestAcpiSmp { num_cpus: 4 })),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "virtio-blk-irq-acpi",
+            Box::new(TestVirtioBlkIrq { acpi: true }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "virtio-blk-irq-no-acpi",
+            Box::new(TestVirtioBlkIrq { acpi: false }),
+        ),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("vsock-guest-reconnect", Box::new(TestVsockGuestReconnect)),
+        #[cfg(target_os = "linux")]
+        TestCase::new("vsock-host-close", Box::new(TestVsockHostClose)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "vsock-host-connect-refused",
+            Box::new(TestVsockHostConnectRefused),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "vsock-guest-connect-refused",
+            Box::new(TestVsockGuestConnectRefused),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "vsock-guest-connect-emfile",
+            Box::new(TestVsockGuestConnectEmfile),
+        ),
         TestCase::new(
             "tsi-tcp-guest-connect",
             Box::new(TestTsiTcpGuestConnect::new()),
@@ -106,8 +204,12 @@ pub fn test_cases() -> Vec<TestCase> {
             "tsi-tcp-guest-listen",
             Box::new(TestTsiTcpGuestListen::new()),
         ),
+        TestCase::new("tsi-tcp-half-close", Box::new(TestTsiTcpHalfClose)),
+        #[cfg(target_os = "linux")]
+        TestCase::new("tsi-unix-host-close", Box::new(TestTsiUnixHostClose)),
         TestCase::new("net-passt", Box::new(TestNet::new_passt())),
         TestCase::new("net-tap", Box::new(TestNet::new_tap())),
+        TestCase::new("net-tap-renew", Box::new(TestTapRenew)),
         TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
         TestCase::new(
             "net-gvproxy-long-path",
@@ -121,6 +223,14 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-fixed-owner", Box::new(TestVirtiofsFixedOwner)),
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
+        #[cfg(target_os = "linux")]
+        TestCase::new("rtc-default", Box::new(TestVirtioRtc { enabled: false })),
+        #[cfg(target_os = "linux")]
+        TestCase::new("virtio-rtc", Box::new(TestVirtioRtc { enabled: true })),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
@@ -203,9 +313,6 @@ mod common;
 
 #[cfg(feature = "host")]
 pub mod common_freebsd;
-
-#[cfg(feature = "host")]
-mod krun;
 
 #[cfg(feature = "host")]
 pub mod rootfs;

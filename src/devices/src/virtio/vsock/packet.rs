@@ -23,11 +23,14 @@ use std::net::{Ipv6Addr, SocketAddrV6};
 use std::os::raw::c_char;
 use std::result;
 
+#[cfg(windows)]
+use super::windows::sockaddr_storage::SockaddrStorage;
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{AddressFamily, sockaddr};
+#[cfg(unix)]
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use utils::byte_order;
-use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
+use vm_memory::{self, Address, GuestAddress, GuestMemoryBackend, GuestMemoryError};
 
 use super::super::DescriptorChain;
 use super::defs;
@@ -194,7 +197,7 @@ pub struct VsockPacket {
     owned_buf: Option<Vec<u8>>,
 }
 
-fn get_host_address<T: GuestMemory>(
+fn get_host_address<T: GuestMemoryBackend>(
     mem: &T,
     guest_addr: GuestAddress,
     size: usize,
@@ -624,6 +627,11 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        SockaddrStorage::from_linux_bytes(buf, addr_len)
+    }
+
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
         if self.buf_size >= 6 {
             let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
@@ -683,6 +691,7 @@ impl VsockPacket {
             byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
             byte_order::write_le_u32(&mut buf[4..], rsp.addr_len);
             let addr_ptr = rsp.addr.as_ptr();
+            #[allow(clippy::unnecessary_cast)]
             let slice = unsafe {
                 std::slice::from_raw_parts(addr_ptr as *const u8, rsp.addr.len() as usize)
             };

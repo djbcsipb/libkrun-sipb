@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -18,33 +18,69 @@ use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
 };
 use libc::c_void;
-#[cfg(target_os = "macos")]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
+#[cfg(any(
+    all(target_os = "linux", feature = "virgl_resource_map2"),
+    target_os = "macos"
+))]
+use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
+use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD;
 #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
+use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_SHM;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
-    RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK,
-    RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
+    RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
+    RUTABAGA_MAP_ACCESS_WRITE, RUTABAGA_PATH_TYPE_PIPEWIRE, RUTABAGA_PATH_TYPE_X11,
 };
 use rutabaga_gfx::{
-    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
-    Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec,
-    Transfer3D,
+    RUTABAGA_MAP_CACHE_MASK, RUTABAGA_PATH_TYPE_WAYLAND, ResourceCreate3D, ResourceCreateBlob,
+    Rutabaga, RutabagaBuilder, RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler,
+    RutabagaIovec, RutabagaPath, RutabagaResult, Transfer3D, VirtioFsLookup,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use super::{GpuError, Result};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
+
+// These constants match libkrun.h and virglrenderer.
+const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
+const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
+const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
+const VIRGLRENDERER_DRM: u32 = 1 << 10;
+
+struct ExportTableLookup {
+    table: ExportTable,
+}
+
+impl ExportTableLookup {
+    fn new(table: ExportTable) -> Self {
+        Self { table }
+    }
+}
+
+impl VirtioFsLookup for ExportTableLookup {
+    fn get_exported_descriptor(
+        &self,
+        fs_id: u64,
+        handle: u64,
+    ) -> RutabagaResult<RutabagaDescriptor> {
+        let table = self.table.lock().unwrap();
+        let file = table
+            .get(&(fs_id, handle))
+            .ok_or(rutabaga_gfx::RutabagaError::InvalidResourceId)?
+            .try_clone()
+            .map_err(|_| rutabaga_gfx::RutabagaError::InvalidResourceId)?;
+
+        Ok(file.into())
+    }
+}
 
 fn sglist_to_rutabaga_iovecs(
     vecs: &[(GuestAddress, usize)],
@@ -234,9 +270,9 @@ impl VirtioGpu {
         let path = PathBuf::from(format!("{xdg_runtime_dir}/{wayland_display}"));
 
         #[allow(unused_mut)]
-        let mut rutabaga_channels: Vec<RutabagaChannel> = vec![RutabagaChannel {
-            base_channel: path,
-            channel_type: RUTABAGA_CHANNEL_TYPE_WAYLAND,
+        let mut rutabaga_paths: Vec<RutabagaPath> = vec![RutabagaPath {
+            path,
+            path_type: RUTABAGA_PATH_TYPE_WAYLAND,
         }];
 
         #[cfg(target_os = "linux")]
@@ -244,9 +280,9 @@ impl VirtioGpu {
             && let Some(x_display) = x_display.strip_prefix(":")
         {
             let x_path = PathBuf::from(format!("/tmp/.X11-unix/X{x_display}"));
-            rutabaga_channels.push(RutabagaChannel {
-                base_channel: x_path,
-                channel_type: RUTABAGA_CHANNEL_TYPE_X11,
+            rutabaga_paths.push(RutabagaPath {
+                path: x_path,
+                path_type: RUTABAGA_PATH_TYPE_X11,
             });
         }
         #[cfg(target_os = "linux")]
@@ -257,28 +293,34 @@ impl VirtioGpu {
             let name = env::var("PIPEWIRE_REMOTE").unwrap_or_else(|_| "pipewire-0".to_string());
             let mut pw_path = PathBuf::from(pw_sock_dir);
             pw_path.push(name);
-            rutabaga_channels.push(RutabagaChannel {
-                base_channel: pw_path,
-                channel_type: RUTABAGA_CHANNEL_TYPE_PW,
+            rutabaga_paths.push(RutabagaPath {
+                path: pw_path,
+                path_type: RUTABAGA_PATH_TYPE_PIPEWIRE,
             });
         }
-        let rutabaga_channels_opt = Some(rutabaga_channels);
-
-        let builder = RutabagaBuilder::new(
-            rutabaga_gfx::RutabagaComponentType::VirglRenderer,
-            virgl_flags,
-            0,
-        )
-        .set_rutabaga_channels(rutabaga_channels_opt);
-        let builder = if let Some(export_table) = export_table {
-            builder.set_export_table(export_table)
-        } else {
-            builder
-        };
 
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
-        builder.clone().build(fence.clone(), None).ok()
+
+        let capset_mask: u64 = virgl_flags_to_capsets(virgl_flags);
+
+        let use_egl = virgl_flags & VIRGLRENDERER_USE_EGL != 0;
+        let use_gles = virgl_flags & VIRGLRENDERER_USE_GLES != 0;
+        let use_render_server = virgl_flags & VIRGLRENDERER_RENDER_SERVER != 0;
+
+        let mut builder = RutabagaBuilder::new(capset_mask, fence)
+            .set_default_component(rutabaga_gfx::RutabagaComponentType::VirglRenderer)
+            .set_use_egl(use_egl)
+            .set_use_gles(use_gles)
+            .set_rutabaga_paths(Some(rutabaga_paths))
+            .set_use_render_server(use_render_server);
+
+        if let Some(export_table) = export_table {
+            let lookup: Arc<dyn VirtioFsLookup> = Arc::new(ExportTableLookup::new(export_table));
+            builder = builder.set_virtiofs_lookup(lookup);
+        }
+
+        builder.build().ok()
     }
 
     pub fn create_fallback_rutabaga(
@@ -287,16 +329,16 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
     ) -> Option<Rutabaga> {
-        const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
-        let builder = RutabagaBuilder::new(
-            rutabaga_gfx::RutabagaComponentType::VirglRenderer,
-            VIRGLRENDERER_NO_VIRGL,
-            0,
-        );
-
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
-        builder.clone().build(fence.clone(), None).ok()
+
+        // Fallback with minimal capset mask and no EGL/GLES
+        let capset_mask = 0;
+
+        RutabagaBuilder::new(capset_mask, fence)
+            .set_default_component(rutabaga_gfx::RutabagaComponentType::VirglRenderer)
+            .build()
+            .ok()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -353,7 +395,7 @@ impl VirtioGpu {
 
     // Non-public function -- no doc comment needed!
     fn result_from_query(&mut self, resource_id: u32) -> GpuResponse {
-        match self.rutabaga.query(resource_id) {
+        match self.rutabaga.resource3d_info(resource_id) {
             Ok(query) => {
                 let mut plane_info = Vec::with_capacity(4);
                 for plane_index in 0..4 {
@@ -574,7 +616,7 @@ impl VirtioGpu {
         transfer: Transfer3D,
     ) -> VirtioGpuResult {
         self.rutabaga
-            .transfer_write(ctx_id, resource_id, transfer)?;
+            .transfer_write(ctx_id, resource_id, transfer, None)?;
         Ok(OkNoData)
     }
 
@@ -585,12 +627,13 @@ impl VirtioGpu {
     /// Can also be used to invalidate caches.
     pub fn transfer_read(
         &mut self,
-        _ctx_id: u32,
-        _resource_id: u32,
-        _transfer: Transfer3D,
-        _buf: Option<VolatileSlice>,
+        ctx_id: u32,
+        resource_id: u32,
+        transfer: Transfer3D,
     ) -> VirtioGpuResult {
-        panic!("virtio_gpu: transfer_read unimplemented");
+        self.rutabaga
+            .transfer_read(ctx_id, resource_id, transfer, None)?;
+        Ok(OkNoData)
     }
 
     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
@@ -770,8 +813,10 @@ impl VirtioGpu {
 
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if export.handle_type != RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD {
+        if let Ok(export) = self.rutabaga.export_blob(resource_id)
+            && let Some(mesa_handle) = export.as_mesa_handle()
+        {
+            if mesa_handle.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
                 let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
                     RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
                     RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
@@ -796,7 +841,7 @@ impl VirtioGpu {
                         resource.size as usize,
                         prot,
                         libc::MAP_SHARED | libc::MAP_FIXED,
-                        export.os_handle.as_raw_fd(),
+                        mesa_handle.os_handle.as_fd().as_raw_fd(),
                         0 as libc::off_t,
                     )
                 };
@@ -846,45 +891,38 @@ impl VirtioGpu {
         .ok_or(ErrUnspec)?;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            // SHM and DMABUF are both regular host fds whose pages can be exposed
-            // to the guest by mmap'ing them directly into the virtio shm region.
-            // For SHM (memfd) this has always worked. For DMABUF it had been
-            // delegated to virgl_renderer_resource_map2, which only handles
-            // virglrenderer-allocated GPU memory and silently no-ops for external
-            // dma-bufs — leaving the guest blob backed by zero pages. That broke
-            // muvm camera capture, where the v4l2 source exports kernel buffers
-            // via VIDIOC_EXPBUF as dma-bufs, the muvm bridge forwards the fd
-            // across SCM_RIGHTS, libkrun classifies it as DMABUF, and the guest's
-            // CREATE_BLOB allocates a host-backed-by-nothing blob. Mapping the
-            // dma-buf fd directly here gives the guest real, live pages.
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
-                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_DMABUF
-            {
-                let ret = unsafe {
-                    libc::mmap(
-                        addr as *mut libc::c_void,
-                        resource.size as usize,
+            if let Some(mesa_handle) = export.as_mesa_handle() {
+                if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_SHM
+                    || mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF
+                {
+                    let ret = unsafe {
+                        libc::mmap(
+                            addr as *mut libc::c_void,
+                            resource.size as usize,
+                            prot,
+                            libc::MAP_SHARED | libc::MAP_FIXED,
+                            mesa_handle.os_handle.as_fd().as_raw_fd(),
+                            0 as libc::off_t,
+                        )
+                    };
+                    if ret == libc::MAP_FAILED {
+                        error!(
+                            "failed to mmap resource in shm region(handle_type={:#x})",
+                            mesa_handle.handle_type
+                        );
+                        return Err(ErrUnspec);
+                    }
+                } else {
+                    self.rutabaga.resource_map(
+                        resource_id,
+                        addr,
+                        resource.size,
                         prot,
                         libc::MAP_SHARED | libc::MAP_FIXED,
-                        export.os_handle.as_raw_fd(),
-                        0 as libc::off_t,
-                    )
-                };
-                if ret == libc::MAP_FAILED {
-                    error!(
-                        "failed to mmap resource in shm region (handle_type={:#x})",
-                        export.handle_type
-                    );
-                    return Err(ErrUnspec);
+                    )?;
                 }
             } else {
-                self.rutabaga.resource_map(
-                    resource_id,
-                    addr,
-                    resource.size,
-                    prot,
-                    libc::MAP_SHARED | libc::MAP_FIXED,
-                )?;
+                return Err(ErrUnspec);
             }
         }
 
@@ -907,10 +945,12 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
+        let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
+        if let Ok(export) = self.rutabaga.export_blob(resource_id)
+            && let Some(mesa_handle) = export.as_mesa_handle()
+        {
+            if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
                 let guest_addr = checked_blob_map_addr(
                     shm_region.guest_addr,
                     offset,
@@ -961,7 +1001,11 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
+        // The guest unmaps a blob it asked to map even when the mapping
+        // failed, and there's nothing in the window to take back.
+        let Some(shmem_offset) = resource.shmem_offset else {
+            return Ok(OkNoData);
+        };
 
         let addr = shm_region.host_addr + shmem_offset;
 
@@ -996,7 +1040,11 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         debug!("resource_unmap_blob");
-        let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
+        // The guest unmaps a blob it asked to map even when the mapping
+        // failed, and there's nothing in the window to take back.
+        let Some(shmem_offset) = resource.shmem_offset else {
+            return Ok(OkNoData);
+        };
 
         let guest_addr = shm_region.guest_addr + shmem_offset;
         debug!(
@@ -1093,4 +1141,29 @@ mod test {
             .for_each(|scanout| scanouts.disable(scanout));
         assert!(!scanouts.has_any_enabled());
     }
+}
+
+/// Translate virglrenderer flags (which became part of the libkrun 1.x public API) to a rutabaga_gfx capset mask.
+/// Won't be necessary anymore when libkrun 2.x removes these from the API.
+pub fn virgl_flags_to_capsets(flags: u32) -> u64 {
+    let mut capset_mask = 0;
+
+    capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_CROSS_DOMAIN;
+
+    if flags & VIRGLRENDERER_NO_VIRGL == 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL;
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2;
+    }
+
+    // Enable Venus if requested (requires render server mode)
+    if flags & VIRGLRENDERER_VENUS != 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VENUS;
+    }
+
+    // Enable DRM native context if requested (in-process mode)
+    if flags & VIRGLRENDERER_DRM != 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
+    }
+
+    capset_mask
 }
