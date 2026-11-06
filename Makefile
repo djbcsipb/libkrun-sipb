@@ -151,6 +151,7 @@ else
 endif
     # Cross-compile on macOS with the LLVM linker (brew install lld)
     CC_BSD=$(CLANG) -target $(ARCH)-unknown-freebsd -fuse-ld=lld -stdlib=libc++ -Wl,-strip-debug --sysroot $(SYSROOT_BSD)
+    CARGO_BSD_CC = $(CLANG) -target $(ARCH)-unknown-freebsd --sysroot=$(abspath $(SYSROOT_BSD))
     CARGO_BSD_RUSTFLAGS = -C linker=$(CLANG) -C link-arg=-target -C link-arg=$(ARCH)-unknown-freebsd -C link-arg=-fuse-ld=lld -C link-arg=-stdlib=libc++ -C link-arg=--sysroot=$(abspath $(SYSROOT_BSD)) -C target-feature=+crt-static
 else ifeq ($(OS),Linux)
 # Linux -> FreeBSD cross-compilation
@@ -162,6 +163,7 @@ else
 endif
     # Cross-compile on Linux with clang
     CC_BSD=$(CLANG) -target $(ARCH)-unknown-freebsd -fuse-ld=lld -Wl,-strip-debug --sysroot $(SYSROOT_BSD)
+    CARGO_BSD_CC = $(CLANG) -target $(ARCH)-unknown-freebsd --sysroot=$(abspath $(SYSROOT_BSD))
     CARGO_BSD_RUSTFLAGS = -C linker=$(CLANG) -C link-arg=-target -C link-arg=$(ARCH)-unknown-freebsd -C link-arg=-fuse-ld=lld -C link-arg=--sysroot=$(abspath $(SYSROOT_BSD)) -C target-feature=+crt-static
 else
     # Build on FreeBSD host
@@ -185,6 +187,7 @@ ifeq ($(BUILD_BSD_INIT),1)
 INIT_BINARY_BSD = init/init-binary/init-freebsd
 $(INIT_BINARY_BSD): $(shell find init/init-binary/src -name '*.rs') init/init-binary/Cargo.toml $(SYSROOT_BSD_TARGET)
 	RUSTFLAGS="$(CARGO_BSD_RUSTFLAGS)" \
+	$(if $(CARGO_BSD_CC),CC_$(subst -,_,$(FREEBSD_RUST_TARGET))="$(CARGO_BSD_CC)") \
 	cargo $(CARGO_BSD_TOOLCHAIN) build --release \
 		$(CARGO_BSD_EXTRA_FLAGS) \
 		--manifest-path init/init-binary/Cargo.toml \
