@@ -51,4 +51,5 @@ runs:
           libepoxy-dev \
           libdrm-dev \
           clang-format \
-          libclang-dev
+          libclang-dev \
+          musl-tools
