@@ -5,6 +5,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#[cfg(target_arch = "x86_64")]
+mod acpi_pm;
 pub mod aia;
 pub mod gic;
 #[cfg(target_os = "macos")]
@@ -50,6 +52,8 @@ mod riscv64;
 use riscv64::serial;
 
 #[cfg(target_arch = "x86_64")]
+pub use self::acpi_pm::AcpiPm;
+#[cfg(target_arch = "x86_64")]
 pub use self::cmos::Cmos;
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;
@@ -59,6 +63,8 @@ pub use self::gpio::Gpio;
 pub use self::hvfgicv3::HvfGicV3;
 #[cfg(target_arch = "x86_64")]
 pub use self::i8042::{Error as I8042DeviceError, I8042Device};
+#[cfg(target_arch = "x86_64")]
+pub use self::ioapic::IOAPIC_EOI_ADDRESS;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::ioapic_kvm::IoApic;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -79,6 +85,8 @@ pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::pit::Pit;
 
 // Cannot use multiple types as bounds for a trait object, so we define our own trait
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.
@@ -90,7 +98,7 @@ pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
 impl ReadableFd for std::fs::File {}
 
 #[cfg(windows)]
-pub trait ReadableFd: std::io::Read + Send {}
+pub trait ReadableFd: std::io::Read + utils::windows::AsRawFd {}
 #[cfg(windows)]
 impl ReadableFd for std::fs::File {}
 

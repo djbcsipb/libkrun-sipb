@@ -9,7 +9,6 @@ use crate::DeviceType;
 use crate::legacy::IrqChip;
 use crate::legacy::aia::AIADevice;
 use arch::riscv64::get_fdt_addr;
-use arch::riscv64::layout::IRQ_BASE;
 use arch::{ArchMemoryInfo, InitrdConfig};
 use vm_fdt::{Error as FdtError, FdtWriter};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
@@ -65,6 +64,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     aia_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
+    riscv_isa_info: &Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
 ) -> Result<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -74,13 +74,13 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // Look for "Required nodes and properties".
 
     // Header or the root node as per above mentioned documentation.
-    let root_node = fdt.begin_node("root")?;
+    let root_node = fdt.begin_node("")?;
     fdt.property_string("compatible", "linux,dummy-virt")?;
     // For info on #address-cells and size-cells resort to Table 3.1 Root Node
     // Properties
     fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
     fdt.property_u32("#size-cells", SIZE_CELLS)?;
-    create_cpu_nodes(&mut fdt, num_vcpu)?;
+    create_cpu_nodes(&mut fdt, num_vcpu, riscv_isa_info)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_aia_node(&mut fdt, aia_device)?;
@@ -101,7 +101,11 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
 }
 
 // Following are the auxiliary function for creating the different nodes that we append to our FDT.
-fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
+fn create_cpu_nodes(
+    fdt: &mut FdtWriter,
+    num_cpus: u32,
+    riscv_isa_info: &Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
+) -> Result<()> {
     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
     let cpus = fdt.begin_node("cpus")?;
     // As per documentation, on RISC-V 64-bit systems value should be set to 1.
@@ -114,7 +118,59 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "riscv")?;
         fdt.property_string("mmu-type", "sv48")?;
-        fdt.property_string("riscv,isa", "rv64imafdc_smaia_ssaia")?;
+
+        // "riscv,isa" is deprecated by the kernel in favor of the
+        // "riscv,isa-base" + "riscv,isa-extensions" pair; we only emit the
+        // modern properties.
+        //
+        // "riscv,isa-base" identifies the base ISA and is always "rv64i" on
+        // riscv64 (see Documentation/devicetree/bindings/riscv/extensions.yaml).
+        fdt.property_string("riscv,isa-base", "rv64i")?;
+
+        // "riscv,isa-extensions" is a devicetree stringlist: each extension
+        // name must be its own NUL-terminated string. property_string_list()
+        // concatenates each entry with its own trailing NUL. Use the
+        // detected extensions if available, otherwise fall back to
+        // `arch::riscv64::linux::kvm::DEFAULT_ISA_EXTENSIONS` so the CPU
+        // node remains valid and matches the same fallback used by the
+        // detection code itself when it cannot probe anything.
+        let ext_list: Vec<String> = match riscv_isa_info {
+            Some(isa_info) if !isa_info.extensions.is_empty() => {
+                isa_info.extensions.iter().cloned().collect()
+            }
+            _ => arch::riscv64::linux::kvm::DEFAULT_ISA_EXTENSIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+
+        // Only emit a cache block size property alongside the extension it
+        // belongs to: the devicetree bindings document these as dependent
+        // on the matching Z extension being listed in
+        // "riscv,isa-extensions", and the guest kernel sizes real `cbo.*`
+        // cache-maintenance instructions off these values, so they must
+        // not be advertised for an extension we did not detect.
+        let has_ext = |name: &str| ext_list.iter().any(|e| e == name);
+        if let Some(isa_info) = riscv_isa_info {
+            if has_ext("zicbom") {
+                if let Some(size) = isa_info.zicbom_block_size {
+                    fdt.property_u32("riscv,cbom-block-size", size)?;
+                }
+            }
+            if has_ext("zicboz") {
+                if let Some(size) = isa_info.zicboz_block_size {
+                    fdt.property_u32("riscv,cboz-block-size", size)?;
+                }
+            }
+            if has_ext("zicbop") {
+                if let Some(size) = isa_info.zicbop_block_size {
+                    fdt.property_u32("riscv,cbop-block-size", size)?;
+                }
+            }
+        }
+
+        fdt.property_string_list("riscv,isa-extensions", ext_list)?;
+
         fdt.property_string("status", "okay")?;
         fdt.property_u32("reg", cpu_index)?;
         fdt.property_u32("phandle", CPU_BASE_PHANDLE + cpu_index)?;
@@ -143,7 +199,10 @@ fn create_memory_node(
     // for an explanation of this.
     let mem_reg_prop = [arch::riscv64::layout::DRAM_MEM_START, mem_size];
 
-    let mem_node = fdt.begin_node("memory")?;
+    let mem_node = fdt.begin_node(&format!(
+        "memory@{:x}",
+        arch::riscv64::layout::DRAM_MEM_START
+    ))?;
     fdt.property_string("device_type", "memory")?;
     fdt.property_array_u64("reg", &mem_reg_prop)?;
     fdt.end_node(mem_node)?;
@@ -215,7 +274,7 @@ fn create_aia_node(fdt: &mut FdtWriter, aia_device: &IrqChip) -> Result<()> {
     fdt.property_array_u32("reg", &reg_cells)?;
     fdt.property_u32("#interrupt-cells", 2u32)?;
     fdt.property_null("interrupt-controller")?;
-    fdt.property_u32("riscv,num-sources", 96u32)?;
+    fdt.property_u32("riscv,num-sources", arch::riscv64::layout::IRQ_MAX)?;
     fdt.property_u32("phandle", AIA_APLIC_PHANDLE)?;
     fdt.property_u32("msi-parent", AIA_IMSIC_PHANDLE)?;
 
@@ -230,7 +289,7 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
 ) -> Result<()> {
     let device_reg_prop = [dev_info.addr(), dev_info.length()];
     #[cfg(target_os = "linux")]
-    let irq = [dev_info.irq() - IRQ_BASE, IRQ_TYPE_LEVEL_HI];
+    let irq = [dev_info.irq(), IRQ_TYPE_LEVEL_HI];
 
     let virtio_node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev_info.addr()))?;
     fdt.property_string("compatible", "virtio,mmio")?;
@@ -247,7 +306,7 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     dev_info: &T,
 ) -> Result<()> {
     let serial_reg_prop = [dev_info.addr(), dev_info.length()];
-    let irq = [dev_info.irq() - IRQ_BASE, IRQ_TYPE_LEVEL_HI];
+    let irq = [dev_info.irq(), IRQ_TYPE_LEVEL_HI];
 
     let serial_node = fdt.begin_node(&format!("serial@{:x}", dev_info.addr()))?;
     fdt.property_string("compatible", "ns16550a")?;

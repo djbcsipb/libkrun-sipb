@@ -3,44 +3,45 @@
 // Alternate Data Streams (ADS) for extended-attribute emulation.
 
 use super::super::inode_alloc::InodeAllocator;
+pub use super::super::{CachePolicy, PermissionSemantics};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
-use std::io;
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{io, ptr};
 
 use libc::S_IFREG;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::Storage::FileSystem::FILE_NON_DIRECTORY_FILE;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_ACCESS_INFORMATION, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION,
-    FILE_ID_BOTH_DIR_INFORMATION, FILE_OPEN, FILE_OPEN_BY_FILE_ID, FILE_OPEN_IF,
-    FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT,
-    FileAccessInformation, FileDispositionInformation, FileIdBothDirectoryInformation,
-    NtCreateFile, NtQueryDirectoryFile, NtQueryInformationFile, NtSetInformationFile, NtWriteFile,
-    RtlNtStatusToDosErrorNoTeb,
+    FILE_ACCESS_INFORMATION, FILE_ALL_INFORMATION, FILE_CREATE, FILE_DIRECTORY_FILE,
+    FILE_DISPOSITION_INFORMATION, FILE_ID_BOTH_DIR_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+    FILE_OPEN_BY_FILE_ID, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE, FILE_OVERWRITE_IF,
+    FILE_STAT_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileAccessInformation, FileAllInformation,
+    FileAttributeTagInformation, FileDispositionInformation, FileIdBothDirectoryInformation,
+    FileStatInformation, IO_REPARSE_TAG_LX_SYMLINK, NtCreateFile, NtQueryDirectoryFile,
+    NtQueryInformationFile, NtSetInformationFile, NtWriteFile, RtlNtStatusToDosErrorNoTeb,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
-    STATUS_NO_MORE_FILES, UNICODE_STRING,
+    CloseHandle, ERROR_ACCESS_DENIED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    NTSTATUS, STATUS_BUFFER_OVERFLOW, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+    STATUS_NO_MORE_FILES, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED, UNICODE_STRING,
 };
-use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
-use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, DeleteFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFileInformationByHandle,
+    DeleteFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_BASIC_INFO, FILE_END_OF_FILE_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileBasicInfo,
+    FileEndOfFileInfo, GetDiskFreeSpaceExW, GetVolumeInformationByHandleW, GetVolumePathNameW,
+    SetFileInformationByHandle,
 };
-use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumePathNameW};
-use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
+use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
 use windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
@@ -56,8 +57,6 @@ use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
 use super::fs_utils::{ebadf, einval, enosys, win_err_to_linux};
 
-use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
-
 const OVERRIDE_STAT_STREAM: &str = ":user.containers.override_stat";
 const SECURITY_CAPABILITY_STREAM: &str = ":security.capability";
 
@@ -67,6 +66,8 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const DELETE: u32 = 0x0001_0000;
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+// IO_STATUS_BLOCK.Information after NtCreateFile made a new file.
+const FILE_CREATED: usize = 2;
 
 const S_ISUID: u32 = 0o04_000;
 const S_IXGRP: u32 = 0o00_010;
@@ -144,6 +145,9 @@ struct InodeData {
     inode: Inode,
     parent_inode: Inode,
     file_index: u64,
+    volume_serial: u32,
+    // Children of a junction or volume mount point may live on another volume.
+    is_mount_point: bool,
     path: RwLock<Arc<PathBuf>>,
     wide_path: RwLock<Arc<Vec<u16>>>,
     refcount: AtomicU64,
@@ -170,27 +174,6 @@ struct CachedDirEntry {
     ino: u64,
     name: Vec<u8>,
     type_: u32,
-}
-
-// CachePolicy — mirrors the macOS version
-#[derive(Debug, Default, Clone)]
-pub enum CachePolicy {
-    Never,
-    #[default]
-    Auto,
-    Always,
-}
-
-impl FromStr for CachePolicy {
-    type Err = &'static str;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
-            "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
-            "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
-            _ => Err("invalid cache policy"),
-        }
-    }
 }
 
 /// Options that configure the behavior of the file system.
@@ -243,8 +226,13 @@ pub struct Config {
 
     /// ID of this filesystem to uniquely identify exports.
     pub export_fsid: u64,
+
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
+
+    /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
+    /// more details.
+    pub semantics: PermissionSemantics,
 }
 
 impl Default for Config {
@@ -258,6 +246,7 @@ impl Default for Config {
             xattr: true,
             export_fsid: 0,
             export_table: None,
+            semantics: PermissionSemantics::LinuxComplete,
         }
     }
 }
@@ -297,105 +286,179 @@ fn unix_to_filetime(secs: i64, nsec: u32) -> u64 {
     (ticks + FILETIME_UNIX_EPOCH_DIFF) as u64
 }
 
-struct FileInfo {
-    file_index: u64,
-    volume_serial: u32,
-    n_number_of_links: u32,
+type FileInfo = FILE_STAT_INFORMATION;
+
+/// `(uid, gid, mode)` as stored in the override_stat stream.
+type OverrideStat = (Option<u32>, Option<u32>, Option<u32>);
+
+fn query_information<T>(handle: HANDLE, info: &mut T, class: i32) -> NTSTATUS {
+    let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
+    unsafe {
+        NtQueryInformationFile(
+            handle,
+            &mut iosb,
+            info as *mut T as *mut core::ffi::c_void,
+            mem::size_of::<T>() as u32,
+            class,
+        )
+    }
 }
 
-/// Query NTFS file-index and volume serial via a temporary handle.
-fn get_file_info(path: &Path) -> io::Result<FileInfo> {
-    let flags = OpenFlags {
-        desired_access: FILE_READ_ATTRIBUTES,
-        create_disposition: FILE_OPEN,
-        create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-    };
-    let h = open_handle(path, &flags)?;
-    unsafe {
-        let mut info: BY_HANDLE_FILE_INFORMATION = mem::zeroed();
-        if GetFileInformationByHandle(h, &mut info) == 0 {
-            CloseHandle(h);
-            return Err(io::Error::last_os_error());
-        }
-        CloseHandle(h);
-        let idx = (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64;
-        Ok(FileInfo {
-            file_index: idx,
-            volume_serial: info.dwVolumeSerialNumber,
-            n_number_of_links: info.nNumberOfLinks,
-        })
+// Borrows the handle. The caller is responsible for closing it.
+fn get_file_info_by_handle(handle: HANDLE) -> io::Result<FileInfo> {
+    let mut info = FileInfo::default();
+    match query_information(handle, &mut info, FileStatInformation) {
+        status if status >= 0 => Ok(info),
+        // FAT, exFAT and some network redirectors don't implement FileStatInformation.
+        STATUS_INVALID_INFO_CLASS
+        | STATUS_NOT_IMPLEMENTED
+        | STATUS_NOT_SUPPORTED
+        | STATUS_INVALID_PARAMETER => get_file_info_by_handle_compat(handle),
+        status => Err(nt_status_to_io_error(status)),
     }
+}
+
+fn get_file_info_by_handle_compat(handle: HANDLE) -> io::Result<FileInfo> {
+    let mut all: FILE_ALL_INFORMATION = unsafe { mem::zeroed() };
+    // The trailing file name never fits; the fixed-size parts are still filled in.
+    let status = query_information(handle, &mut all, FileAllInformation);
+    if status < 0 && status != STATUS_BUFFER_OVERFLOW {
+        return Err(nt_status_to_io_error(status));
+    }
+
+    let basic = &all.BasicInformation;
+    let standard = &all.StandardInformation;
+    let mut tag_info: FILE_ATTRIBUTE_TAG_INFO = unsafe { mem::zeroed() };
+    if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        let status = query_information(handle, &mut tag_info, FileAttributeTagInformation);
+        if status < 0 {
+            return Err(nt_status_to_io_error(status));
+        }
+    }
+
+    Ok(FileInfo {
+        FileId: all.InternalInformation.IndexNumber,
+        CreationTime: basic.CreationTime,
+        LastAccessTime: basic.LastAccessTime,
+        LastWriteTime: basic.LastWriteTime,
+        ChangeTime: basic.ChangeTime,
+        AllocationSize: standard.AllocationSize,
+        EndOfFile: standard.EndOfFile,
+        FileAttributes: basic.FileAttributes,
+        ReparseTag: tag_info.ReparseTag,
+        NumberOfLinks: standard.NumberOfLinks,
+        EffectiveAccess: all.AccessInformation.AccessFlags,
+    })
+}
+
+fn get_volume_serial_by_handle(handle: HANDLE) -> io::Result<u32> {
+    let mut serial = 0u32;
+    let res = unsafe {
+        GetVolumeInformationByHandleW(
+            handle,
+            ptr::null_mut(),
+            0,
+            &mut serial,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if res == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(serial)
+    }
+}
+
+fn as_file_handle(handle: Handle) -> Option<HANDLE> {
+    (handle != 0 && (handle & (1 << 63)) == 0).then_some(handle as HANDLE)
+}
+
+/// The access rights granted to `handle`.
+fn handle_access(handle: HANDLE) -> Option<u32> {
+    let mut access_info: FILE_ACCESS_INFORMATION = unsafe { mem::zeroed() };
+    (query_information(handle, &mut access_info, FileAccessInformation) >= 0)
+        .then_some(access_info.AccessFlags)
 }
 
 pub fn is_handle_read_only(handle: u64) -> bool {
     // Ignore directory entries
-    if handle == 0 || (handle & (1 << 63)) != 0 {
+    let Some(raw_handle) = as_file_handle(handle) else {
         return true;
-    }
-
-    let raw_handle = handle as windows_sys::Win32::Foundation::HANDLE;
-    let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
-    let mut access_info: FILE_ACCESS_INFORMATION = unsafe { mem::zeroed() };
-
-    let status = unsafe {
-        NtQueryInformationFile(
-            raw_handle,
-            &mut iosb,
-            &mut access_info as *mut _ as *mut core::ffi::c_void,
-            mem::size_of::<FILE_ACCESS_INFORMATION>() as u32,
-            FileAccessInformation,
-        )
     };
 
-    if status >= 0 {
-        // If the handle lacks both standard WRITE and APPEND permissions, it was opened Read-Only
-        (access_info.AccessFlags & (FILE_WRITE_DATA | FILE_APPEND_DATA)) == 0
-    } else {
-        // Fallback: If the kernel query fails for some reason, assume it's writable
-        // to let standard error handling catch any violations later.
-        false
-    }
+    // If the handle lacks both standard WRITE and APPEND permissions, it was opened Read-Only.
+    // If the kernel query fails for some reason, assume it's writable to let standard error
+    // handling catch any violations later.
+    handle_access(raw_handle)
+        .is_some_and(|access| access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0)
 }
 
-fn get_reparse_tag(path: &Path) -> u32 {
-    let wide = path_to_wide(path);
-    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-
-    let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
-    if handle != INVALID_HANDLE_VALUE {
-        unsafe { FindClose(handle) };
-        if data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return data.dwReserved0; // This field holds the exact reparse tag!
+/// Build a `stat64` from `FILE_STAT_INFORMATION`, applying the override_stat xattr when available.
+fn file_info_to_stat64(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    info: &FileInfo,
+    ino: u64,
+    path: &Path,
+    handle: HANDLE,
+) -> stat64 {
+    let override_stat = match semantics {
+        PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedFixedOwner => {
+            None
         }
-    }
-    0
+        PermissionSemantics::LinuxComplete => read_override_stat(path).ok(),
+    };
+    build_stat64(ctx, semantics, info, ino, handle, override_stat)
 }
 
-/// Build a `stat64` from Windows `Metadata`, applying override_stat xattr when available.
-fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -> stat64 {
-    let file_attributes = meta.file_attributes();
+fn build_stat64(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    info: &FileInfo,
+    ino: u64,
+    handle: HANDLE,
+    override_stat: Option<OverrideStat>,
+) -> stat64 {
+    let file_attributes = info.FileAttributes;
 
     let is_directory = (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    let mut is_symlink = meta.file_type().is_symlink();
-    if is_symlink && (file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0) {
-        let tag = get_reparse_tag(path);
-        if tag == IO_REPARSE_TAG_MOUNT_POINT {
-            is_symlink = false; // It's a Volume Mount! Force it to be a native directory.
-        }
-    }
+    let is_reparse = (file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+    // If it's a reparse point and not a mount point, it's a symlink
+    let is_symlink = is_reparse && info.ReparseTag != IO_REPARSE_TAG_MOUNT_POINT;
+
+    let mut size = info.EndOfFile;
+
     let (base_mode, nlink) = if is_symlink {
+        if let Ok(target) = read_lx_symlink_by_handle(handle) {
+            // st_size MUST match the exact length returned by readlink()
+            size = target.len() as i64;
+        }
         (S_IFLNK | 0o777, 1)
     } else if is_directory {
         (libc::S_IFDIR | 0o755, 2u32)
     } else {
-        (libc::S_IFREG | 0o644, n_link)
+        let is_readonly = (file_attributes & FILE_ATTRIBUTE_READONLY) != 0;
+        let mode_bits = match semantics {
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => {
+                if is_readonly {
+                    0o444
+                } else {
+                    0o644
+                }
+            }
+            PermissionSemantics::LinuxComplete => 0o644,
+        };
+        (libc::S_IFREG | mode_bits, info.NumberOfLinks)
     };
 
-    let size = meta.len() as i64;
-
-    let creation = meta.creation_time();
-    let access = meta.last_access_time();
-    let write = meta.last_write_time();
+    let access = info.LastAccessTime as u64;
+    let write = info.LastWriteTime as u64;
+    let change = info.ChangeTime as u64;
 
     let mut st = stat64 {
         st_dev: 0,
@@ -410,29 +473,76 @@ fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -
         st_atime_nsec: filetime_to_unix_nsec(access),
         st_mtime: filetime_to_unix_secs(write),
         st_mtime_nsec: filetime_to_unix_nsec(write),
-        st_ctime: filetime_to_unix_secs(creation),
-        st_ctime_nsec: filetime_to_unix_nsec(creation),
+        st_ctime: filetime_to_unix_secs(change),
+        st_ctime_nsec: filetime_to_unix_nsec(change),
         st_blksize: 4096,
         st_blocks: (size + 511) / 512,
     };
 
-    if let Ok((uid, gid, mode)) = read_override_stat(path) {
-        if let Some(uid) = uid {
-            st.st_uid = uid;
+    match semantics {
+        PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedFixedOwner => {
+            st.st_uid = ctx.uid;
+            st.st_gid = ctx.gid;
         }
-        if let Some(gid) = gid {
-            st.st_gid = gid;
-        }
-        if let Some(mode) = mode {
-            if mode & libc::S_IFMT as u32 == 0 {
-                st.st_mode = (st.st_mode & libc::S_IFMT as u32) | mode;
-            } else {
-                st.st_mode = mode;
+        PermissionSemantics::LinuxComplete => {
+            if let Some((uid, gid, mode)) = override_stat {
+                if let Some(uid) = uid {
+                    st.st_uid = uid;
+                }
+                if let Some(gid) = gid {
+                    st.st_gid = gid;
+                }
+                if let Some(mode) = mode {
+                    if mode & libc::S_IFMT as u32 == 0 {
+                        st.st_mode = (st.st_mode & libc::S_IFMT as u32) | mode;
+                    } else {
+                        st.st_mode = mode;
+                    }
+                }
             }
         }
     }
 
     st
+}
+
+fn read_lx_symlink_by_handle(handle: HANDLE) -> io::Result<Vec<u8>> {
+    let mut buffer = [0u8; 16384];
+    let mut bytes_returned = 0u32;
+
+    let result = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buffer.as_mut_ptr() as *mut _,
+            buffer.len() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if result == 0 || bytes_returned < 8 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Inspect ReparseTag (first 4 bytes)
+    let tag = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+    if tag != IO_REPARSE_TAG_LX_SYMLINK as u32 {
+        return Err(io::Error::other("Not an LX_SYMLINK reparse point"));
+    }
+
+    let data_len = u16::from_le_bytes(buffer[4..6].try_into().unwrap()) as usize;
+    if bytes_returned < (8 + data_len) as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Truncated LX_SYMLINK payload",
+        ));
+    }
+
+    // Target UTF-8 bytes start at offset 8
+    Ok(buffer[8..8 + data_len].to_vec())
 }
 
 // ADS-backed override_stat helpers  (uid:gid:0mode)
@@ -470,9 +580,11 @@ fn write_override_stat(
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
 ) -> io::Result<()> {
-    let buf = if is_valid_owner(owner) && mode.is_some() {
+    let buf = if is_valid_owner(owner)
+        && let Some(m) = mode
+    {
         let (uid, gid) = owner.unwrap();
-        format!("{}:{}:0{:o}", uid, gid, mode.unwrap())
+        format!("{}:{}:0{:o}", uid, gid, m)
     } else {
         let (orig_uid, orig_gid, orig_mode) = read_override_stat(path)?;
         let (uid, gid) = match owner {
@@ -659,7 +771,7 @@ fn clear_suid_sgid(mode: u32) -> u32 {
 fn ads_xattr_path(base: &Path, name: &CStr) -> PathBuf {
     let attr_name = name.to_string_lossy();
     let mut s = base.as_os_str().to_os_string();
-    s.push(&format!(":{}", attr_name));
+    s.push(format!(":{}", attr_name));
     PathBuf::from(s)
 }
 
@@ -695,14 +807,12 @@ fn ads_list_streams(path: &Path) -> io::Result<Vec<String>> {
             .to_string_lossy()
             .to_string();
 
-        if name != "::$DATA" {
-            if let Some(stripped) = name.strip_prefix(':') {
-                if let Some(attr) = stripped.strip_suffix(":$DATA") {
-                    if !attr.is_empty() {
-                        out.push(attr.to_string());
-                    }
-                }
-            }
+        if name != "::$DATA"
+            && let Some(stripped) = name.strip_prefix(':')
+            && let Some(attr) = stripped.strip_suffix(":$DATA")
+            && !attr.is_empty()
+        {
+            out.push(attr.to_string());
         }
 
         if unsafe { FindNextStreamW(h, &mut fsd as *mut _ as *mut _) } == 0 {
@@ -742,7 +852,7 @@ fn parse_linux_open_flags(linux_flags: i32, writeback: bool) -> OpenFlags {
 
     match flags & 0b11 {
         0 => access |= GENERIC_READ,
-        1 => access |= GENERIC_WRITE,
+        1 => access |= GENERIC_WRITE | FILE_READ_ATTRIBUTES,
         2 => access |= GENERIC_READ | GENERIC_WRITE,
         _ => {}
     }
@@ -779,6 +889,11 @@ fn parse_linux_open_flags(linux_flags: i32, writeback: bool) -> OpenFlags {
 
 /// Open a file via NtCreateFile with case-sensitive semantics.
 fn open_handle(path: &Path, flags: &OpenFlags) -> io::Result<HANDLE> {
+    open_handle_reporting_creation(path, flags).map(|(h, _)| h)
+}
+
+/// Like `open_handle`, also telling whether the call created the file.
+fn open_handle_reporting_creation(path: &Path, flags: &OpenFlags) -> io::Result<(HANDLE, bool)> {
     let mut nt_path = path_to_nt_wide(path);
     let byte_len = (nt_path.len() - 1) * 2; // excluding null terminator
 
@@ -817,7 +932,7 @@ fn open_handle(path: &Path, flags: &OpenFlags) -> io::Result<HANDLE> {
     };
 
     if status >= 0 {
-        Ok(handle)
+        Ok((handle, iosb.Information == FILE_CREATED))
     } else {
         Err(nt_status_to_io_error(status))
     }
@@ -916,6 +1031,31 @@ fn open_relative(parent_handle: HANDLE, name: &CStr, flags: &OpenFlags) -> io::R
     }
 }
 
+/// Duplicate a handle within this process, with the same access rights.
+fn duplicate_handle(handle: HANDLE) -> io::Result<HANDLE> {
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
+    let current_process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+    let mut dup_h: HANDLE = INVALID_HANDLE_VALUE;
+
+    let res = unsafe {
+        windows_sys::Win32::Foundation::DuplicateHandle(
+            current_process,
+            handle,
+            current_process,
+            &mut dup_h,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+
+    if res != 0 {
+        Ok(dup_h)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Mark an open handle for deletion. The actual removal happens on close.
 fn set_delete_disposition(handle: HANDLE) -> io::Result<()> {
     let info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
@@ -948,55 +1088,71 @@ pub fn openat(path: &str) -> io::Result<HANDLE> {
     };
     let h = open_handle(p, &flags)?;
 
-    unsafe {
-        let mut info: BY_HANDLE_FILE_INFORMATION = mem::zeroed();
-        if GetFileInformationByHandle(h, &mut info) == 0 {
-            CloseHandle(h);
-            return Err(io::Error::last_os_error());
+    let info = match get_file_info_by_handle(h) {
+        Ok(info) => info,
+        Err(e) => {
+            unsafe { CloseHandle(h) };
+            return Err(e);
         }
-        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            CloseHandle(h);
-            return Err(linux_error(io::Error::new(
-                io::ErrorKind::Other,
-                "Reparse point detected — path is not safe",
-            )));
-        }
+    };
+    if (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        unsafe { CloseHandle(h) };
+        return Err(linux_error(io::Error::other(
+            "Reparse point detected — path is not safe",
+        )));
     }
     Ok(h)
 }
 
-fn set_file_times(path: &Path, atime: Option<u64>, mtime: Option<u64>) -> io::Result<()> {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::Storage::FileSystem::SetFileTime;
-
-    let flags = OpenFlags {
-        desired_access: FILE_WRITE_ATTRIBUTES,
-        create_disposition: FILE_OPEN,
-        create_options: FILE_SYNCHRONOUS_IO_NONALERT,
+/// Set file attributes together with access and modification times in a
+/// single metadata update. `None` leaves the corresponding field untouched.
+fn set_file_basic_info(
+    h: HANDLE,
+    attributes: Option<u32>,
+    atime: Option<u64>,
+    mtime: Option<u64>,
+) -> io::Result<()> {
+    let info = FILE_BASIC_INFO {
+        CreationTime: 0,
+        LastAccessTime: atime.map_or(0, |v| v as i64),
+        LastWriteTime: mtime.map_or(0, |v| v as i64),
+        ChangeTime: 0,
+        // Zero means "unchanged" here, so an empty attribute set must be
+        // spelled FILE_ATTRIBUTE_NORMAL.
+        FileAttributes: match attributes {
+            Some(0) => FILE_ATTRIBUTE_NORMAL,
+            Some(attrs) => attrs,
+            None => 0,
+        },
     };
-    let h = open_handle(path, &flags).map_err(win_err_to_linux)?;
-
-    let to_ft = |v: u64| -> FILETIME {
-        FILETIME {
-            dwLowDateTime: v as u32,
-            dwHighDateTime: (v >> 32) as u32,
-        }
-    };
-
-    let a_ft = atime.map(to_ft);
-    let m_ft = mtime.map(to_ft);
 
     let res = unsafe {
-        SetFileTime(
+        SetFileInformationByHandle(
             h,
-            std::ptr::null(),
-            a_ft.as_ref().map_or(std::ptr::null(), |f| f as *const _),
-            m_ft.as_ref().map_or(std::ptr::null(), |f| f as *const _),
+            FileBasicInfo,
+            &info as *const _ as *const core::ffi::c_void,
+            mem::size_of::<FILE_BASIC_INFO>() as u32,
         )
     };
-    unsafe { CloseHandle(h) };
     if res == 0 {
-        Err(win_err_to_linux(io::Error::last_os_error()))
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn set_file_size_by_handle(h: HANDLE, size: i64) -> io::Result<()> {
+    let info = FILE_END_OF_FILE_INFO { EndOfFile: size };
+    let res = unsafe {
+        SetFileInformationByHandle(
+            h,
+            FileEndOfFileInfo,
+            &info as *const _ as *const core::ffi::c_void,
+            mem::size_of::<FILE_END_OF_FILE_INFO>() as u32,
+        )
+    };
+    if res == 0 {
+        Err(io::Error::last_os_error())
     } else {
         Ok(())
     }
@@ -1050,10 +1206,15 @@ pub struct PassthroughFs {
 
     /// Handle to the root directory, kept open for FILE_OPEN_BY_FILE_ID.
     root_handle: RwLock<HANDLE>,
+    /// File IDs only resolve on this volume.
+    root_volume_serial: u32,
 
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
     cfg: Config,
+
+    /// Guest file handles currently open, per inode.
+    open_files: Mutex<BTreeMap<Inode, Vec<Handle>>>,
 }
 
 // Windows HANDLEs (*mut c_void) are thread-safe to move and share across OS threads.
@@ -1063,6 +1224,13 @@ unsafe impl Sync for PassthroughFs {}
 impl PassthroughFs {
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
         let root_handle = openat(&cfg.root_dir)?;
+        let root_volume_serial = match get_volume_serial_by_handle(root_handle) {
+            Ok(serial) => serial,
+            Err(e) => {
+                unsafe { CloseHandle(root_handle) };
+                return Err(e);
+            }
+        };
 
         Ok(PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
@@ -1070,9 +1238,11 @@ impl PassthroughFs {
             next_handle: AtomicU64::new(1),
             dir_caches: RwLock::new(BTreeMap::new()),
             root_handle: RwLock::new(root_handle),
+            root_volume_serial,
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
             cfg,
+            open_files: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1085,25 +1255,97 @@ impl PassthroughFs {
             .ok_or_else(ebadf)
     }
 
+    /// Open an inode by file ID when it lives on the root's volume, by path
+    /// otherwise.
+    fn open_inode(&self, data: &InodeData, flags: &OpenFlags) -> io::Result<HANDLE> {
+        if data.volume_serial == self.root_volume_serial {
+            let root_h = *self.root_handle.read().unwrap();
+            open_by_id(root_h, data.file_index, flags)
+                .or_else(|_| open_handle(&data.get_path(), flags))
+        } else {
+            open_handle(&data.get_path(), flags)
+        }
+    }
+
     fn inode_path(&self, inode: Inode) -> io::Result<Arc<PathBuf>> {
         Ok(self.inode_data(inode)?.get_path())
     }
 
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+    fn do_lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let name_bytes = name.to_bytes();
+        if name_bytes == b"." {
+            let (attr, _) = self.do_getattr(ctx, parent, None)?;
+            return Ok(Entry {
+                inode: parent,
+                generation: 0,
+                attr,
+                attr_flags: 0,
+                attr_timeout: self.cfg.attr_timeout,
+                entry_timeout: self.cfg.entry_timeout,
+            });
+        }
+        if name_bytes == b".." {
+            let parent_data = self.inode_data(parent)?;
+            let grand_parent = parent_data.parent_inode;
+            let (attr, _) = self.do_getattr(ctx, grand_parent, None)?;
+            return Ok(Entry {
+                inode: grand_parent,
+                generation: 0,
+                attr,
+                attr_flags: 0,
+                attr_timeout: self.cfg.attr_timeout,
+                entry_timeout: self.cfg.entry_timeout,
+            });
+        }
         let parent_data = self.inode_data(parent)?;
         let child_name = cstr_to_path(name);
         let child_path = parent_data.get_path().join(&child_name);
 
-        let file_info = get_file_info(&child_path).map_err(win_err_to_linux)?;
+        let flags = OpenFlags {
+            desired_access: FILE_READ_ATTRIBUTES,
+            create_disposition: FILE_OPEN,
+            create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        };
+        let handle = HandleGuard(open_handle(&child_path, &flags)?);
+        self.entry_from_handle(
+            ctx,
+            parent,
+            &parent_data,
+            &child_path,
+            handle.as_raw(),
+            None,
+        )
+    }
+
+    /// Register the child opened as `handle` and build its entry. `handle`
+    /// must refer to `child_path` itself, not to a reparse point's target.
+    /// `known_override` spares reading back an override_stat just written.
+    fn entry_from_handle(
+        &self,
+        ctx: &Context,
+        parent: Inode,
+        parent_data: &InodeData,
+        child_path: &Path,
+        handle: HANDLE,
+        known_override: Option<OverrideStat>,
+    ) -> io::Result<Entry> {
+        let file_info = get_file_info_by_handle(handle).map_err(win_err_to_linux)?;
+        let volume_serial = if parent_data.is_mount_point {
+            // Fail rather than guess: a wrong serial would let file indexes
+            // from two volumes collide in the inode map.
+            get_volume_serial_by_handle(handle).map_err(win_err_to_linux)?
+        } else {
+            parent_data.volume_serial
+        };
         let alt_key = InodeAltKey {
-            file_index: file_info.file_index,
-            volume_serial: file_info.volume_serial,
+            file_index: file_info.FileId as u64,
+            volume_serial,
         };
 
         let inode = {
             let handle_existing = |existing: &Arc<InodeData>| {
                 existing.refcount.fetch_add(1, Ordering::Acquire);
-                existing.update_path_if_changed(&child_path);
+                existing.update_path_if_changed(child_path);
                 existing.inode
             };
 
@@ -1128,9 +1370,13 @@ impl PassthroughFs {
                         Arc::new(InodeData {
                             inode,
                             parent_inode: parent,
-                            file_index: file_info.file_index,
-                            path: RwLock::new(Arc::new(child_path.clone())),
-                            wide_path: RwLock::new(Arc::new(path_to_wide(&child_path))),
+                            file_index: file_info.FileId as u64,
+                            volume_serial,
+                            is_mount_point: file_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT
+                                != 0
+                                && file_info.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT,
+                            path: RwLock::new(Arc::new(child_path.to_path_buf())),
+                            wide_path: RwLock::new(Arc::new(path_to_wide(child_path))),
                             refcount: AtomicU64::new(1),
                         }),
                     );
@@ -1139,18 +1385,32 @@ impl PassthroughFs {
             }
         };
 
-        let meta = fs::symlink_metadata(&child_path).map_err(win_err_to_linux)?;
-        let st = metadata_to_stat64(&meta, inode, &child_path, file_info.n_number_of_links);
+        let st = match known_override {
+            Some(override_stat) => build_stat64(
+                ctx,
+                self.cfg.semantics,
+                &file_info,
+                inode,
+                handle,
+                Some(override_stat),
+            ),
+            None => file_info_to_stat64(
+                ctx,
+                self.cfg.semantics,
+                &file_info,
+                inode,
+                child_path,
+                handle,
+            ),
+        };
 
         let mut attr_flags = 0u32;
         if st.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
             && self.announce_submounts.load(Ordering::Relaxed)
         {
             // Different volume ⟹ submount
-            if let Ok(parent_file_info) = get_file_info(&parent_data.get_path()) {
-                if file_info.volume_serial != parent_file_info.volume_serial {
-                    attr_flags |= fuse::ATTR_SUBMOUNT;
-                }
+            if volume_serial != parent_data.volume_serial {
+                attr_flags |= fuse::ATTR_SUBMOUNT;
             }
         }
 
@@ -1164,33 +1424,49 @@ impl PassthroughFs {
         })
     }
 
-    fn do_getattr(&self, inode: Inode, handle: Option<Handle>) -> io::Result<(stat64, Duration)> {
+    fn open_for_setattr(&self, data: &InodeData, desired_access: u32) -> io::Result<HandleGuard> {
+        // A setattr on a symlink inode targets the link itself.
+        let flags = OpenFlags {
+            desired_access,
+            create_disposition: FILE_OPEN,
+            create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        };
+        self.open_inode(data, &flags)
+            .map(HandleGuard)
+            .map_err(win_err_to_linux)
+    }
+
+    fn do_getattr(
+        &self,
+        ctx: &Context,
+        inode: Inode,
+        handle: Option<Handle>,
+    ) -> io::Result<(stat64, Duration)> {
         let path = self.inode_path(inode)?;
 
-        if let Some(h) = handle {
-            if h != 0 && (h & (1 << 63)) == 0 {
-                if let Ok(file) = self.reopen_inode(inode, h, FILE_READ_ATTRIBUTES) {
-                    if let Ok(meta) = file.metadata() {
-                        let mut n_link = 1;
-                        unsafe {
-                            let mut info: BY_HANDLE_FILE_INFORMATION = mem::zeroed();
-                            if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info)
-                                != 0
-                            {
-                                n_link = info.nNumberOfLinks;
-                            }
-                        }
-                        let st = metadata_to_stat64(&meta, inode, &path, n_link);
-                        return Ok((st, self.cfg.attr_timeout));
-                    }
-                }
+        let (raw_h, _guard) = match handle.and_then(as_file_handle) {
+            Some(h) => (h as HANDLE, None),
+            None if let Some(guard) = self.dup_open_file(inode, FILE_READ_ATTRIBUTES) => {
+                (guard.as_raw(), Some(guard))
             }
-        }
+            _ => {
+                let h = open_handle(
+                    &path,
+                    &OpenFlags {
+                        desired_access: FILE_READ_ATTRIBUTES,
+                        create_disposition: FILE_OPEN,
+                        create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                    },
+                )?;
+                // HandleGuard will call CloseHandle automatically when dropped at end of scope!
+                (h, Some(HandleGuard(h)))
+            }
+        };
 
-        let meta = fs::symlink_metadata(&*path).map_err(win_err_to_linux)?;
-        let file_info = get_file_info(&path).map_err(win_err_to_linux)?;
-        let st = metadata_to_stat64(&meta, inode, &path, file_info.n_number_of_links);
-        Ok((st, self.cfg.attr_timeout))
+        let info = get_file_info_by_handle(raw_h).map_err(win_err_to_linux)?;
+
+        let stat = file_info_to_stat64(ctx, self.cfg.semantics, &info, inode, &path, raw_h);
+        Ok((stat, self.cfg.attr_timeout))
     }
 
     // To avoid global lookup maps we reuse Win32 HANDLE for file descriptors and
@@ -1228,28 +1504,24 @@ impl PassthroughFs {
         if is_dir {
             let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed) | (1 << 63);
             let mut opts = OpenOptions::empty();
-            match self.cfg.cache_policy {
-                CachePolicy::Always => opts |= OpenOptions::CACHE_DIR,
-                _ => {}
+            if let CachePolicy::Always = self.cfg.cache_policy {
+                opts |= OpenOptions::CACHE_DIR;
             }
             return Ok((Some(handle_id), opts));
         }
 
         let data = self.inode_data(inode)?;
-        let root_h = *self.root_handle.read().unwrap();
-        let h = open_by_id(root_h, data.file_index, &oflags)
-            .or_else(|_| open_handle(&data.get_path(), &oflags))
-            .map_err(win_err_to_linux)?;
+        let h = self.open_inode(&data, &oflags).map_err(win_err_to_linux)?;
 
-        if kill_priv {
+        if kill_priv && matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
             let path = data.get_path();
             remove_security_capability(&path);
             if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
                 let new_mode = clear_suid_sgid(mode);
-                if new_mode != mode {
-                    if let Err(e) = write_override_stat(&path, None, Some(new_mode)) {
-                        error!("clear suid/sgid for inode {inode}: {e}");
-                    }
+                if new_mode != mode
+                    && let Err(e) = write_override_stat(&path, None, Some(new_mode))
+                {
+                    error!("clear suid/sgid for inode {inode}: {e}");
                 }
             }
         }
@@ -1261,14 +1533,16 @@ impl PassthroughFs {
             _ => {}
         }
 
+        self.register_open_file(inode, h as u64);
         Ok((Some(h as u64), opts))
     }
 
-    fn do_release(&self, _inode: Inode, handle: Handle) -> io::Result<()> {
+    fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         // Check if it's a tagged directory handle or a raw file handle
         if handle & (1 << 63) != 0 {
             self.dir_caches.write().unwrap().remove(&handle);
         } else {
+            self.unregister_open_file(inode, handle);
             let h = handle as HANDLE;
             if h != INVALID_HANDLE_VALUE && !h.is_null() {
                 unsafe { CloseHandle(h) };
@@ -1277,45 +1551,63 @@ impl PassthroughFs {
         Ok(())
     }
 
+    fn register_open_file(&self, inode: Inode, handle: Handle) {
+        self.open_files
+            .lock()
+            .unwrap()
+            .entry(inode)
+            .or_default()
+            .push(handle);
+    }
+
+    fn unregister_open_file(&self, inode: Inode, handle: Handle) {
+        let mut open_files = self.open_files.lock().unwrap();
+        if let Some(handles) = open_files.get_mut(&inode) {
+            handles.retain(|&h| h != handle);
+            if handles.is_empty() {
+                open_files.remove(&inode);
+            }
+        }
+    }
+
+    /// Duplicate a guest file handle of `inode` that grants `desired_access`.
+    ///
+    /// Requests without a file handle (e.g. utimensat() or stat() by path)
+    /// often target a file the guest still holds open: close(2) returns
+    /// before the kernel sends RELEASE, so an extractor restoring timestamps
+    /// right after writing a file races its own release. Reopening such a
+    /// file is expensive, as filter drivers (e.g. antivirus) process the new
+    /// open and closing it is the last-handle close that commits NTFS
+    /// metadata. A duplicate shares the open file instead, and closing it is
+    /// cheap since the guest's handle keeps the file open.
+    fn dup_open_file(&self, inode: Inode, desired_access: u32) -> Option<HandleGuard> {
+        let open_files = self.open_files.lock().unwrap();
+        let handle = open_files
+            .get(&inode)?
+            .iter()
+            .map(|&h| h as HANDLE)
+            .find(|&h| handle_access(h).is_some_and(|a| a & desired_access == desired_access))?;
+        duplicate_handle(handle).ok().map(HandleGuard)
+    }
+
     /// Open a fresh file handle via `open_by_id` (falling back to
     /// path-based open).  The caller owns the returned `File`; the
     /// underlying handle is closed on drop.
     fn reopen_inode(&self, inode: Inode, handle: Handle, desired_access: u32) -> io::Result<File> {
         // If the handle is a valid persistent raw file handle (not zero, and no directory tag bit)
-        if handle != 0 && (handle & (1 << 63)) == 0 {
-            const DUPLICATE_SAME_ACCESS: u32 = 2;
-            let current_process =
-                unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
-            let mut dup_h: HANDLE = INVALID_HANDLE_VALUE;
-
-            let res = unsafe {
-                windows_sys::Win32::Foundation::DuplicateHandle(
-                    current_process,
-                    handle as HANDLE,
-                    current_process,
-                    &mut dup_h,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            };
-
-            if res != 0 {
-                return Ok(unsafe { File::from_raw_handle(dup_h as RawHandle) });
-            } else {
-                return Err(win_err_to_linux(io::Error::last_os_error()));
-            }
+        if let Some(raw_handle) = as_file_handle(handle) {
+            return duplicate_handle(raw_handle)
+                .map(|dup_h| unsafe { File::from_raw_handle(dup_h as RawHandle) })
+                .map_err(win_err_to_linux);
         }
 
         let data = self.inode_data(inode)?;
-        let root_h = *self.root_handle.read().unwrap();
         let flags = OpenFlags {
             desired_access,
             create_disposition: FILE_OPEN,
             create_options: FILE_SYNCHRONOUS_IO_NONALERT,
         };
-        let h = open_by_id(root_h, data.file_index, &flags)
-            .or_else(|_| open_handle(&data.get_path(), &flags))?;
+        let h = self.open_inode(&data, &flags)?;
         Ok(unsafe { File::from_raw_handle(h as RawHandle) })
     }
 
@@ -1326,7 +1618,6 @@ impl PassthroughFs {
         }
 
         let inode_data = self.inode_data(inode)?;
-        let root_h = *self.root_handle.read().unwrap();
 
         let dir_flags = OpenFlags {
             desired_access: GENERIC_READ,
@@ -1334,8 +1625,7 @@ impl PassthroughFs {
             create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE,
         };
         let dir_g = HandleGuard(
-            open_by_id(root_h, inode_data.file_index, &dir_flags)
-                .or_else(|_| open_handle(&inode_data.get_path(), &dir_flags))
+            self.open_inode(&inode_data, &dir_flags)
                 .map_err(win_err_to_linux)?,
         );
 
@@ -1435,11 +1725,18 @@ impl FileSystem for PassthroughFs {
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         let root_path = PathBuf::from(&self.cfg.root_dir);
-        let file_info = get_file_info(&root_path).map_err(win_err_to_linux)?;
+        let file_info = {
+            let mut root_h = self.root_handle.write().unwrap();
+            // destroy() closes the root handle; a later init() remounts.
+            if *root_h == INVALID_HANDLE_VALUE {
+                *root_h = openat(&self.cfg.root_dir)?;
+            }
+            get_file_info_by_handle(*root_h).map_err(win_err_to_linux)?
+        };
 
         let alt_key = InodeAltKey {
-            file_index: file_info.file_index,
-            volume_serial: file_info.volume_serial,
+            file_index: file_info.FileId as u64,
+            volume_serial: self.root_volume_serial,
         };
 
         let mut inodes = self.inodes.write().unwrap();
@@ -1449,7 +1746,10 @@ impl FileSystem for PassthroughFs {
             Arc::new(InodeData {
                 inode: fuse::ROOT_ID,
                 parent_inode: fuse::ROOT_ID,
-                file_index: file_info.file_index,
+                file_index: file_info.FileId as u64,
+                volume_serial: self.root_volume_serial,
+                // openat() refuses a reparse point as the shared root.
+                is_mount_point: false,
                 path: RwLock::new(Arc::new(root_path.clone())),
                 wide_path: RwLock::new(Arc::new(path_to_wide(&root_path))),
                 refcount: AtomicU64::new(2),
@@ -1475,6 +1775,7 @@ impl FileSystem for PassthroughFs {
 
     fn destroy(&self) {
         self.dir_caches.write().unwrap().clear();
+        self.open_files.lock().unwrap().clear();
         self.inodes.write().unwrap().clear();
         let h = std::mem::replace(
             &mut *self.root_handle.write().unwrap(),
@@ -1536,8 +1837,8 @@ impl FileSystem for PassthroughFs {
         })
     }
 
-    fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        self.do_lookup(parent, name)
+    fn lookup(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        self.do_lookup(&ctx, parent, name)
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
@@ -1586,11 +1887,9 @@ impl FileSystem for PassthroughFs {
         }
 
         let parent_data = self.inode_data(parent)?;
-        let root_h = *self.root_handle.read().unwrap();
         let parent_g = HandleGuard(
-            open_by_id(
-                root_h,
-                parent_data.file_index,
+            self.open_inode(
+                &parent_data,
                 &OpenFlags {
                     desired_access: GENERIC_READ,
                     create_disposition: FILE_OPEN,
@@ -1613,23 +1912,33 @@ impl FileSystem for PassthroughFs {
             .map_err(win_err_to_linux)?,
         );
 
-        if let Some(secctx) = extensions.secctx {
-            let stream_name = format!(":{}", secctx.name.to_string_lossy());
-            write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+        let dir_mode = mode & !umask;
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+            if let Some(secctx) = extensions.secctx {
+                let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+            }
+
+            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, dir_mode);
+            write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
         }
 
-        let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
-        write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
-        self.do_lookup(parent, name)
+        let child_path = parent_data.get_path().join(cstr_to_path(name));
+        self.entry_from_handle(
+            &ctx,
+            parent,
+            &parent_data,
+            &child_path,
+            child_g.as_raw(),
+            Some((Some(ctx.uid), Some(ctx.gid), Some(dir_mode))),
+        )
     }
 
     fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
         let parent_data = self.inode_data(parent)?;
-        let root_h = *self.root_handle.read().unwrap();
         let parent_g = HandleGuard(
-            open_by_id(
-                root_h,
-                parent_data.file_index,
+            self.open_inode(
+                &parent_data,
                 &OpenFlags {
                     desired_access: GENERIC_READ,
                     create_disposition: FILE_OPEN,
@@ -1702,7 +2011,7 @@ impl FileSystem for PassthroughFs {
 
     fn readdirplus<F>(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Handle,
         _size: u32,
@@ -1722,7 +2031,7 @@ impl FileSystem for PassthroughFs {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let entry = match self.do_lookup(inode, &name_cstr) {
+            let entry = match self.do_lookup(&ctx, inode, &name_cstr) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -1745,124 +2054,210 @@ impl FileSystem for PassthroughFs {
 
     fn getattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Option<Handle>,
     ) -> io::Result<(stat64, Duration)> {
-        self.do_getattr(inode, handle)
+        self.do_getattr(&ctx, inode, handle)
     }
 
     fn setattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         attr: stat64,
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(stat64, Duration)> {
-        let path = self.inode_path(inode)?;
+        let data = self.inode_data(inode)?;
+        let path = data.get_path();
 
-        // Extract or read current cached state cleanly to avoid overwriting conflicts
-        let (mut current_uid, mut current_gid, mut current_mode) =
-            read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None));
-
-        let mut override_changed = false;
-
-        if valid.contains(SetattrValid::MODE) {
-            current_mode = Some(attr.st_mode);
-            override_changed = true;
-        }
-
-        if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
-            if valid.contains(SetattrValid::UID) {
-                current_uid = Some(attr.st_uid);
-            }
-            if valid.contains(SetattrValid::GID) {
-                current_gid = Some(attr.st_gid);
-            };
-
-            remove_security_capability(&path);
-
-            if !valid.contains(SetattrValid::MODE) {
-                if let Some(mode) = current_mode {
-                    let new_mode = clear_suid_sgid(mode);
-                    current_mode = Some(new_mode);
+        let mut mode_writable: Option<bool> = None;
+        let mut known_override: Option<OverrideStat> = None;
+        match self.cfg.semantics {
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => {
+                // In LinuxSimplified mode:
+                // 1. UID/GID changes (chown) are ignored since ownership is dynamically returned as ctx.uid/gid.
+                // 2. Extended attribute (ADS) overrides are not written.
+                // 3. chmod maps POSIX write permissions to the native Windows Read-Only attribute.
+                if valid.contains(SetattrValid::MODE) {
+                    mode_writable = Some((attr.st_mode & 0o200) != 0);
                 }
             }
+            PermissionSemantics::LinuxComplete => {
+                // In LinuxComplete mode, preserve permissions and ownership using the ADS stream.
+                // Check if any state mutation requires updating the ADS metadata
+                let needs_suid_clear = valid.contains(SetattrValid::SIZE)
+                    || valid.intersects(SetattrValid::UID | SetattrValid::GID);
 
-            override_changed = true;
-        }
+                if valid.intersects(SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID)
+                    || needs_suid_clear
+                {
+                    // Single read to inspect current state
+                    let (mut current_uid, mut current_gid, mut current_mode) =
+                        read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None));
 
-        if valid.contains(SetattrValid::SIZE) {
-            if let Some(h) = handle {
-                // POSIX Compliance: Allocating space on a Read-Only FD should return EBADF
-                if is_handle_read_only(h) {
-                    return Err(ebadf());
+                    let mut override_changed = false;
+
+                    if valid.contains(SetattrValid::MODE) {
+                        current_mode = Some(attr.st_mode);
+                        override_changed = true;
+                    }
+
+                    if valid.contains(SetattrValid::UID) {
+                        current_uid = Some(attr.st_uid);
+                        override_changed = true;
+                    }
+
+                    if valid.contains(SetattrValid::GID) {
+                        current_gid = Some(attr.st_gid);
+                        override_changed = true;
+                    }
+
+                    // If size or ownership changed, clear capabilities and suid/sgid
+                    if needs_suid_clear {
+                        remove_security_capability(&path);
+
+                        if !valid.contains(SetattrValid::MODE)
+                            && let Some(mode) = current_mode
+                        {
+                            let new_mode = clear_suid_sgid(mode);
+                            if new_mode != mode {
+                                current_mode = Some(new_mode);
+                                override_changed = true;
+                            }
+                        }
+                    }
+
+                    // Single unified write if metadata changed
+                    if override_changed {
+                        // An out-of-range id keeps the stored one, so a chown
+                        // of a single id still persists when the other is unset.
+                        let owner_param = (
+                            current_uid.unwrap_or(u32::MAX),
+                            current_gid.unwrap_or(u32::MAX),
+                        );
+                        write_override_stat(&path, Some(owner_param), current_mode)?;
+                    }
+
+                    // The stream now holds these values, so the reply can
+                    // skip reading it back.
+                    known_override = Some((current_uid, current_gid, current_mode));
                 }
-
-                let file = self
-                    .reopen_inode(inode, h, GENERIC_READ | GENERIC_WRITE)
-                    .map_err(win_err_to_linux)?;
-                file.set_len(attr.st_size as u64)
-                    .map_err(win_err_to_linux)?;
-            } else {
-                let file = fs::OpenOptions::new()
-                    .write(true)
-                    .open(&*path)
-                    .map_err(win_err_to_linux)?;
-                file.set_len(attr.st_size as u64)
-                    .map_err(win_err_to_linux)?;
             }
+        }
 
-            remove_security_capability(&path);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let now_ft = unix_to_filetime(now.as_secs() as i64, now.subsec_nanos());
 
-            if let Some(mode) = current_mode {
-                let new_mode = clear_suid_sgid(mode);
-                if new_mode != mode {
-                    current_mode = Some(new_mode);
-                    override_changed = true;
+        let atime = if valid.contains(SetattrValid::ATIME_NOW) {
+            Some(now_ft)
+        } else if valid.contains(SetattrValid::ATIME) {
+            Some(unix_to_filetime(attr.st_atime, attr.st_atime_nsec))
+        } else {
+            None
+        };
+
+        let mtime = if valid.contains(SetattrValid::MTIME_NOW) {
+            Some(now_ft)
+        } else if valid.contains(SetattrValid::MTIME) {
+            Some(unix_to_filetime(attr.st_mtime, attr.st_mtime_nsec))
+        } else {
+            None
+        };
+
+        // Every field is applied on a single handle whose metadata is queried
+        // once and patched into the reply.
+        let (h, owned_handle) = match handle.and_then(as_file_handle) {
+            Some(h) => (h, None),
+            None => {
+                let mut desired_access = FILE_READ_ATTRIBUTES;
+                if mode_writable.is_some() || atime.is_some() || mtime.is_some() {
+                    desired_access |= FILE_WRITE_ATTRIBUTES;
                 }
+                if valid.contains(SetattrValid::SIZE) {
+                    desired_access |= FILE_WRITE_DATA;
+                }
+                let guard = match self.dup_open_file(inode, desired_access) {
+                    Some(guard) => guard,
+                    None => self.open_for_setattr(&data, desired_access)?,
+                };
+                (guard.as_raw(), Some(guard))
             }
+        };
+
+        let mut info = get_file_info_by_handle(h).map_err(win_err_to_linux)?;
+        let mut changed = false;
+
+        // Truncating to the current size is a no-op
+        if valid.contains(SetattrValid::SIZE) && info.EndOfFile != attr.st_size {
+            set_file_size_by_handle(h, attr.st_size).map_err(|e| {
+                // POSIX: truncating through an fd not open for writing is EBADF.
+                if owned_handle.is_none() && e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+                    ebadf()
+                } else {
+                    win_err_to_linux(e)
+                }
+            })?;
+            info.EndOfFile = attr.st_size;
+            changed = true;
         }
 
-        if override_changed {
-            let owner_param = match (current_uid, current_gid) {
-                (Some(u), Some(g)) => Some((u, g)),
-                _ => None,
-            };
-            write_override_stat(&path, owner_param, current_mode)?;
+        let new_attrs = mode_writable
+            .map(|is_writable| {
+                if is_writable {
+                    info.FileAttributes & !FILE_ATTRIBUTE_READONLY
+                } else {
+                    info.FileAttributes | FILE_ATTRIBUTE_READONLY
+                }
+            })
+            .filter(|&attrs| attrs != info.FileAttributes);
+
+        if new_attrs.is_some() || atime.is_some() || mtime.is_some() {
+            match set_file_basic_info(h, new_attrs, atime, mtime) {
+                // Linux allows fchmod/futimens through an O_RDONLY fd, whose
+                // handle lacks FILE_WRITE_ATTRIBUTES.
+                Err(e)
+                    if owned_handle.is_none()
+                        && e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) =>
+                {
+                    let guard = self.open_for_setattr(&data, FILE_WRITE_ATTRIBUTES)?;
+                    set_file_basic_info(guard.as_raw(), new_attrs, atime, mtime)
+                }
+                res => res,
+            }
+            .map_err(win_err_to_linux)?;
+            if let Some(attrs) = new_attrs {
+                info.FileAttributes = attrs;
+            }
+            if let Some(atime) = atime {
+                info.LastAccessTime = atime as i64;
+            }
+            if let Some(mtime) = mtime {
+                info.LastWriteTime = mtime as i64;
+            }
+            changed = true;
         }
 
-        if valid.intersects(
-            SetattrValid::ATIME
-                | SetattrValid::MTIME
-                | SetattrValid::ATIME_NOW
-                | SetattrValid::MTIME_NOW,
-        ) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let now_ft = unix_to_filetime(now.as_secs() as i64, now.subsec_nanos());
-
-            let atime = if valid.contains(SetattrValid::ATIME_NOW) {
-                Some(now_ft)
-            } else if valid.contains(SetattrValid::ATIME) {
-                Some(unix_to_filetime(attr.st_atime, attr.st_atime_nsec))
-            } else {
-                None
-            };
-
-            let mtime = if valid.contains(SetattrValid::MTIME_NOW) {
-                Some(now_ft)
-            } else if valid.contains(SetattrValid::MTIME) {
-                Some(unix_to_filetime(attr.st_mtime, attr.st_mtime_nsec))
-            } else {
-                None
-            };
-            set_file_times(&path, atime, mtime).map_err(win_err_to_linux)?;
+        if changed {
+            info.ChangeTime = now_ft as i64;
         }
 
-        self.do_getattr(inode, handle)
+        let stat = match known_override {
+            Some(override_stat) => build_stat64(
+                &ctx,
+                self.cfg.semantics,
+                &info,
+                inode,
+                h,
+                Some(override_stat),
+            ),
+            None => file_info_to_stat64(&ctx, self.cfg.semantics, &info, inode, &path, h),
+        };
+        Ok((stat, self.cfg.attr_timeout))
     }
 
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
@@ -1876,12 +2271,30 @@ impl FileSystem for PassthroughFs {
 
         let path = data.get_path();
 
-        let target = fs::read_link(&*path).map_err(win_err_to_linux)?;
+        let handle = HandleGuard(open_handle(
+            &path,
+            &OpenFlags {
+                desired_access: FILE_READ_ATTRIBUTES,
+                create_disposition: FILE_OPEN,
+                create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            },
+        )?);
+
+        let mut buf = match read_lx_symlink_by_handle(handle.as_raw()) {
+            Ok(buf) => buf,
+            _ => {
+                let target = fs::read_link(&*path).map_err(win_err_to_linux)?;
+                target.to_string_lossy().into_owned().into_bytes()
+            }
+        };
 
         // Convert Windows path formatting back to a Linux-friendly format.
         // Windows symlinks use '\', but the FUSE Linux guest expects '/'
-        let unix_path = target.to_string_lossy().replace('\\', "/");
-        let mut buf = unix_path.into_bytes();
+        buf.iter_mut().for_each(|b| {
+            if *b == b'\\' {
+                *b = b'/'
+            }
+        });
 
         // Cap to PATH_MAX (4096) to match Linux parity exactly.
         // While Windows NT paths can be 32k, FUSE/Linux expects a max of 4096 bytes.
@@ -1927,17 +2340,19 @@ impl FileSystem for PassthroughFs {
             .or_else(|_| std::os::windows::fs::symlink_dir(&target, &link_path))
             .map_err(win_err_to_linux)?;
 
-        if let Some(secctx) = extensions.secctx {
-            write_secctx(&link_path, secctx, true)?;
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+            if let Some(secctx) = extensions.secctx {
+                write_secctx(&link_path, secctx, true)?;
+            }
+
+            write_override_stat(
+                &link_path,
+                Some((ctx.uid, ctx.gid)),
+                Some(S_IFLNK as u32 | 0o777),
+            )?;
         }
 
-        write_override_stat(
-            &link_path,
-            Some((ctx.uid, ctx.gid)),
-            Some(S_IFLNK as u32 | 0o777),
-        )?;
-
-        self.do_lookup(parent, name)
+        self.do_lookup(&ctx, parent, name)
     }
 
     fn mknod(
@@ -1956,13 +2371,11 @@ impl FileSystem for PassthroughFs {
         }
 
         let parent_data = self.inode_data(parent)?;
-        let root_h = *self.root_handle.read().unwrap();
 
         // Open parent directory securely (matching Linux mknodat's dirfd behavior)
         let parent_g = HandleGuard(
-            open_by_id(
-                root_h,
-                parent_data.file_index,
+            self.open_inode(
+                &parent_data,
                 &OpenFlags {
                     desired_access: GENERIC_READ,
                     create_disposition: FILE_OPEN,
@@ -1987,19 +2400,30 @@ impl FileSystem for PassthroughFs {
             .map_err(win_err_to_linux)?,
         );
 
-        // Write security context via the active handle
-        if let Some(secctx) = extensions.secctx {
-            let stream_name = format!(":{}", secctx.name.to_string_lossy());
-            write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+        let node_mode = mode & !umask;
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+            // Write security context via the active handle
+            if let Some(secctx) = extensions.secctx {
+                let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+            }
+
+            // Write ownership and mode to ADS via the active handle
+            // Note: The `mode` parameter naturally contains the file type bits
+            // (S_IFIFO, S_IFCHR, S_IFSOCK, etc.) which will be persisted here.
+            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, node_mode);
+            write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
         }
 
-        // Write ownership and mode to ADS via the active handle
-        // Note: The `mode` parameter naturally contains the file type bits
-        // (S_IFIFO, S_IFCHR, S_IFSOCK, etc.) which will be persisted here.
-        let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
-        write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
-
-        self.do_lookup(parent, name)
+        let child_path = parent_data.get_path().join(cstr_to_path(name));
+        self.entry_from_handle(
+            &ctx,
+            parent,
+            &parent_data,
+            &child_path,
+            child_g.as_raw(),
+            Some((Some(ctx.uid), Some(ctx.gid), Some(node_mode))),
+        )
     }
 
     // There is one minor edge-case to be aware of
@@ -2008,11 +2432,9 @@ impl FileSystem for PassthroughFs {
     // This means that a Linux guest attempting to unlink a readonly file will fail with Access Denied, even if the parent directory is writable
     fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
         let parent_data = self.inode_data(parent)?;
-        let root_h = *self.root_handle.read().unwrap();
         let parent_g = HandleGuard(
-            open_by_id(
-                root_h,
-                parent_data.file_index,
+            self.open_inode(
+                &parent_data,
                 &OpenFlags {
                     desired_access: GENERIC_READ,
                     create_disposition: FILE_OPEN,
@@ -2086,7 +2508,7 @@ impl FileSystem for PassthroughFs {
 
     fn link(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         newparent: Inode,
         newname: &CStr,
@@ -2099,7 +2521,7 @@ impl FileSystem for PassthroughFs {
         // Because NTFS shares MFT records for hard links, the existing ADS
         // permissions are natively shared with the new link!
         fs::hard_link(&*existing, &new_path).map_err(win_err_to_linux)?;
-        self.do_lookup(newparent, newname)
+        self.do_lookup(&ctx, newparent, newname)
     }
 
     fn open(
@@ -2141,45 +2563,48 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
         }
 
-        let parent_path = self.inode_path(parent)?;
-        let child_path = parent_path.join(cstr_to_path(name));
+        let parent_data = self.inode_data(parent)?;
+        let child_path = parent_data.get_path().join(cstr_to_path(name));
 
         let wb = self.writeback.load(Ordering::Relaxed);
-        let oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
-        let h = open_handle(&child_path, &oflags).map_err(win_err_to_linux)?;
+        let mut oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
+        // The entry of a created file is built from this handle's metadata.
+        oflags.desired_access |= FILE_READ_ATTRIBUTES;
+        let (h, created) =
+            open_handle_reporting_creation(&child_path, &oflags).map_err(win_err_to_linux)?;
+        let guard = HandleGuard(h);
+        let linux_complete = matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete);
 
-        if let Some(secctx) = extensions.secctx {
-            let stream_name = format!(":{}", secctx.name.to_string_lossy());
-            if let Err(e) = write_ads_by_handle(h, &stream_name, &secctx.secctx) {
-                unsafe { CloseHandle(h) };
-                return Err(e);
+        let entry = if created {
+            let file_mode = S_IFREG as u32 | (mode & !(umask & 0o777));
+            if linux_complete {
+                if let Some(secctx) = extensions.secctx {
+                    let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                    write_ads_by_handle(h, &stream_name, &secctx.secctx)?;
+                }
+
+                let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, file_mode);
+                write_ads_by_handle(h, OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
             }
-        }
 
-        // Write the ownership and mode using the open handle directly
-        let stat_str = format!(
-            "{}:{}:0{:o}",
-            ctx.uid,
-            ctx.gid,
-            S_IFREG as u32 | (mode & !(umask & 0o777))
-        );
-        if let Err(e) = write_ads_by_handle(h, OVERRIDE_STAT_STREAM, stat_str.as_bytes()) {
-            unsafe { CloseHandle(h) };
-            return Err(e);
-        }
-
-        // If O_TRUNC and kill_priv are set, strip capabilities
-        if (flags as i32 & LINUX_O_TRUNC) != 0 && kill_priv {
-            remove_security_capability(&child_path);
-        }
-
-        let entry = match self.do_lookup(parent, name) {
-            Ok(e) => e,
-            Err(e) => {
-                unsafe { CloseHandle(h) };
-                return Err(e);
+            self.entry_from_handle(
+                &ctx,
+                parent,
+                &parent_data,
+                &child_path,
+                h,
+                Some((Some(ctx.uid), Some(ctx.gid), Some(file_mode))),
+            )?
+        } else {
+            if linux_complete && (flags as i32 & LINUX_O_TRUNC) != 0 && kill_priv {
+                remove_security_capability(&child_path);
             }
+
+            // An existing name may be a symlink, in which case `h` refers to
+            // its target while the entry must describe the link itself.
+            self.do_lookup(&ctx, parent, name)?
         };
+        mem::forget(guard);
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
@@ -2188,6 +2613,7 @@ impl FileSystem for PassthroughFs {
             _ => {}
         }
 
+        self.register_open_file(entry.inode, h as u64);
         Ok((entry, Some(h as u64), opts))
     }
 
@@ -2204,10 +2630,28 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
 
-        let file = self
-            .reopen_inode(inode, handle, GENERIC_READ)
-            .map_err(win_err_to_linux)?;
-        w.write_from(&file, size as usize, offset)
+        // Instead of opening a new file handle, if we have a valid handle we borrow it
+        let borrowed_file = if let Some(raw_h) = as_file_handle(handle) {
+            // We use ManuallyDrop to ensure `file` is NEVER dropped,
+            // preventing handle closure even if `write_from` panics.
+            let file = unsafe { std::fs::File::from_raw_handle(raw_h as _) };
+            Some(ManuallyDrop::new(file))
+        } else {
+            None
+        };
+
+        let opened_file;
+        let file_ref: &std::fs::File = match &borrowed_file {
+            Some(file) => file,
+            None => {
+                opened_file = self
+                    .reopen_inode(inode, handle, GENERIC_READ)
+                    .map_err(win_err_to_linux)?;
+                &opened_file
+            }
+        };
+
+        w.write_from(file_ref, size as usize, offset)
     }
 
     fn write<R: io::Read + ZeroCopyReader>(
@@ -2236,7 +2680,10 @@ impl FileSystem for PassthroughFs {
         };
 
         // Only process kill_priv if the write was successful, and log any errors
-        if result.is_ok() && kill_priv {
+        if result.is_ok()
+            && kill_priv
+            && matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete)
+        {
             let path = self.inode_path(inode)?;
             remove_security_capability(&path);
 
@@ -2257,19 +2704,25 @@ impl FileSystem for PassthroughFs {
     fn flush(
         &self,
         _ctx: Context,
-        inode: Inode,
-        handle: Handle,
+        _inode: Inode,
+        _handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        // On Windows, to perform a flush we need to have a file handle with write access.
-        // If the file has been open as read-only, there is nothing to flush
-        if is_handle_read_only(handle) {
-            return Ok(());
-        }
-
-        let file = self.reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)?;
-
-        file.sync_all().map_err(win_err_to_linux)
+        // FUSE `flush` is called on every guest close(2) to give userspace filesystems
+        // a chance to flush internal process buffers and return write errors (e.g., ENOSPC).
+        // POSIX close(2) carries no durability guarantees; it only expects dirty userspace
+        // buffers to reach the OS page cache.
+        //
+        // Because all guest writes are already dispatched directly to host Windows handles
+        // via WriteFile(), there are no uncommitted user-mode buffers held in this VMM process.
+        // We intentionally do NOT call FlushFileBuffers() here, as forcing a physical disk sync
+        // on every file close adds severe millisecond-level latency. Guests requiring data
+        // durability issue fsync(2), which is properly handled by FlushFileBuffers() in `fsync`.
+        //
+        // With nothing to do, ENOSYS makes the guest kernel stop sending FLUSH altogether,
+        // saving a full round trip on every close(2). POSIX locks are not supported either,
+        // so no lock owner state needs to be released here
+        Err(enosys())
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
@@ -2301,6 +2754,11 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) {
+            // Directories and files owned by ctx always have access unless host-level denied
+            return Ok(());
+        }
+
         // POSIX access mode constants (since Windows libc doesn't define them)
         const F_OK: u32 = 0;
         const X_OK: u32 = 1;
@@ -2308,7 +2766,7 @@ impl FileSystem for PassthroughFs {
         const R_OK: u32 = 4;
 
         // Get the emulated POSIX stats from the ADS override stream
-        let (st, _) = self.do_getattr(inode, None)?;
+        let (st, _) = self.do_getattr(&ctx, inode, None)?;
 
         let mode = mask & (R_OK | W_OK | X_OK);
 
@@ -2356,7 +2814,7 @@ impl FileSystem for PassthroughFs {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
-        if !self.cfg.xattr {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
             return Err(enosys());
         }
 
@@ -2387,7 +2845,7 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
-        if !self.cfg.xattr {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
             return Err(enosys());
         }
 
@@ -2403,10 +2861,10 @@ impl FileSystem for PassthroughFs {
 
         let data = fs::read(&stream).map_err(|e| {
             let code = e.raw_os_error().unwrap_or(0) as u32;
-            if code == 2 || code == 3 {
-                // Windows treats ADS as part of the path, so if the ADS has not been set it
-                // returns ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3).
-                // This is normally mapped to ENOENT, but we map it to ENODATA instead to match Linux behavior.
+            if code == 2 || code == 3 || code == 123 {
+                // Windows treats ADS as part of the path. If the ADS is missing (2, 3)
+                // or the guest requested an xattr name that is an illegal Windows name (123)
+                // We map them to ENODATA instead to match Linux behavior.
                 // If we return ENOENT, the guest will think the file does not exist, which is not what we want.
                 io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA))
             } else {
@@ -2424,7 +2882,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
-        if !self.cfg.xattr {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
             return Err(enosys());
         }
 
@@ -2450,7 +2908,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
-        if !self.cfg.xattr {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
             return Err(enosys());
         }
 
@@ -2563,7 +3021,7 @@ impl FileSystem for PassthroughFs {
         unsafe { GetSystemInfo(&mut sys_info) };
         let granularity = sys_info.dwAllocationGranularity as u64;
 
-        if foffset % granularity != 0 {
+        if !foffset.is_multiple_of(granularity) {
             error!("foffset {foffset} is not aligned to {granularity}");
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
@@ -2572,7 +3030,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
-        let is_write = (flags & (fuse::SetupmappingFlags::WRITE.bits() as u64)) != 0;
+        let is_write = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
         let page_flags = if is_write {
             PAGE_READWRITE
         } else {

@@ -12,47 +12,31 @@ const HOST_OWNED_FILE: &str = "host_owned_file";
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter_with_env;
-    use crate::{Test, TestOutcome, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
+    use crate::common::setup_and_run_with_env;
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
     use std::io::Read;
-    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
 
     impl Test for TestVirtioFsMisc {
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if crate::common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
+            }
+            ShouldRun::Yes
+        }
+
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             // Create a host-owned file in the rootfs before entering the VM.
-            // Inside the guest it must appear as root-owned: on Linux via user
-            // namespace mapping, on macOS via the EUID→0 mapping (PR #734).
             let root_dir = test_setup.tmp_dir.join("rootfs");
             std::fs::create_dir_all(&root_dir)?;
             std::fs::write(root_dir.join(HOST_OWNED_FILE), b"host-data")?;
 
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 1, 1024))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-
-                // Forward KRUN_NO_UNSHARE to the guest so UID/GID mapping
-                // subtests can skip themselves when no user namespace is active.
-                let mut guest_env: Vec<&std::ffi::CStr> = Vec::new();
-                if std::env::var_os("KRUN_NO_UNSHARE").is_some() {
-                    guest_env.push(c"KRUN_NO_UNSHARE=1");
-                }
-                setup_fs_and_enter_with_env(ctx, test_setup, &guest_env)?;
+            let mut guest_env: Vec<&str> = Vec::new();
+            if std::env::var_os("KRUN_NO_UNSHARE").is_some() {
+                guest_env.push("KRUN_NO_UNSHARE=1");
             }
-            Ok(())
+            setup_and_run_with_env(1, 1024, test_setup, &guest_env)
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {
@@ -93,7 +77,23 @@ mod host {
                 "host: data after hole should be 0xAA"
             );
 
+            // Verify non-UTF-8 names: the guest's bytes reach the host directory
+            // as they are on Linux; macOS rewrites the invalid byte to U+FFFD.
+            let expected: &[u8] = if cfg!(target_os = "macos") {
+                "non_utf8_\u{FFFD}".as_bytes()
+            } else {
+                b"non_utf8_\xff"
+            };
+            let path = root
+                .join("test_non_utf8_names")
+                .join(std::ffi::OsStr::from_bytes(expected));
+            assert!(path.is_file(), "host: {} missing", path.display());
+
             TestOutcome::Pass
+        }
+
+        fn timeout_secs(&self) -> u64 {
+            30
         }
     }
 }
@@ -734,6 +734,114 @@ mod guest {
         }
     }
 
+    /// A directory larger than many READDIRPLUS replies lists every name once, with the
+    /// attributes the host has, and removes cleanly.
+    fn test_readdirplus_large_directory() {
+        let dir = "/test_readdirplus_large_directory";
+        fs::create_dir(dir).expect("mkdir");
+        let names: HashSet<String> = (0..3000)
+            .map(|i| format!("entry-with-a-long-name-to-fill-the-reply-buffer-{i:05}"))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            fs::write(format!("{dir}/{name}"), vec![b'x'; i % 100]).expect("write entry");
+        }
+
+        let mut seen = HashSet::new();
+        for entry in fs::read_dir(dir).expect("read_dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().into_string().expect("utf-8 name");
+            let len = entry.metadata().expect("metadata").len();
+            let on_disk = fs::metadata(format!("{dir}/{name}")).expect("stat").len();
+            assert_eq!(len, on_disk, "{name}: size from the listing");
+            assert!(seen.insert(name.clone()), "{name} listed twice");
+        }
+        assert_eq!(seen, names, "the listing holds exactly the names created");
+
+        fs::remove_dir_all(dir).expect("remove_dir_all");
+        assert!(fs::metadata(dir).is_err(), "directory removed");
+    }
+
+    /// The entry's name, after a stat of it, which keeps the kernel on READDIRPLUS.
+    fn listed_name(entry: fs::DirEntry) -> String {
+        let _ = entry.metadata();
+        entry.file_name().into_string().unwrap()
+    }
+
+    /// A name removed while the guest is part-way through a listing does not end the listing:
+    /// every other name still appears.
+    fn test_readdirplus_name_removed_mid_listing() {
+        let dir = "/test_readdirplus_name_removed_mid_listing";
+        fs::create_dir(dir).expect("mkdir");
+        let names: HashSet<String> = (0..3000)
+            .map(|i| format!("entry-with-a-long-name-to-fill-the-reply-buffer-{i:05}"))
+            .collect();
+        for name in &names {
+            fs::write(format!("{dir}/{name}"), b"").expect("write entry");
+        }
+
+        let mut listing = fs::read_dir(dir).expect("read_dir");
+        let mut seen = HashSet::new();
+        for entry in listing.by_ref().take(100) {
+            seen.insert(listed_name(entry.expect("dir entry")));
+        }
+        let removed = names
+            .iter()
+            .find(|name| !seen.contains(*name))
+            .expect("a name not listed yet")
+            .clone();
+        fs::remove_file(format!("{dir}/{removed}")).expect("unlink mid-listing");
+        for entry in listing {
+            seen.insert(listed_name(entry.expect("dir entry")));
+        }
+        seen.remove(&removed);
+
+        let expected: HashSet<String> = names.iter().filter(|n| **n != removed).cloned().collect();
+        assert_eq!(
+            seen.len(),
+            expected.len(),
+            "the listing ended early instead of passing over the removed name"
+        );
+        assert_eq!(seen, expected);
+
+        fs::remove_dir_all(dir).expect("remove_dir_all");
+    }
+
+    /// File names are arbitrary bytes on Linux; the server must serve them
+    /// without assuming UTF-8. The `lookup` debug log used to format the
+    /// name with `to_str().unwrap()`, which panicked the fs worker thread on
+    /// the first such name and left every later request hanging, so with
+    /// the harness's trace logging this subtest never returns on that bug.
+    fn test_non_utf8_file_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = "/test_non_utf8_names";
+        fs::create_dir(dir).expect("mkdir");
+        let name = OsStr::from_bytes(b"non_utf8_\xff");
+        let file = std::path::Path::new(dir).join(name);
+        fs::write(&file, b"data").expect("write non-UTF-8 name");
+
+        let meta = fs::metadata(&file).expect("stat non-UTF-8 name");
+        assert_eq!(meta.len(), 4, "size of the non-UTF-8 named file");
+        assert_eq!(fs::read(&file).expect("read"), b"data");
+
+        // readdir must hand the entry back (compared lossily: a macOS host
+        // rewrites the invalid byte to U+FFFD and serves that consistently).
+        let listed = fs::read_dir(dir)
+            .expect("readdir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            listed.contains(&name.to_string_lossy().into_owned()),
+            "readdir should list the non-UTF-8 name, got {listed:?}"
+        );
+
+        let sub = std::path::Path::new(dir).join(OsStr::from_bytes(b"dir_\xff"));
+        fs::create_dir(&sub).expect("mkdir non-UTF-8 dir");
+        fs::write(sub.join("inner"), b"").expect("write inside non-UTF-8 dir");
+        fs::metadata(sub.join("inner")).expect("stat inside non-UTF-8 dir");
+    }
+
     impl Test for TestVirtioFsMisc {
         fn in_guest(self: Box<Self>) {
             run_subtests(&[
@@ -764,6 +872,15 @@ mod guest {
                     test_uid_gid_mapping_preexisting_files,
                 ),
                 ("uid_gid_mapping_chown", test_uid_gid_mapping_chown),
+                ("non_utf8_file_names", test_non_utf8_file_names),
+                (
+                    "readdirplus_large_directory",
+                    test_readdirplus_large_directory,
+                ),
+                (
+                    "readdirplus_name_removed_mid_listing",
+                    test_readdirplus_name_removed_mid_listing,
+                ),
             ]);
         }
     }

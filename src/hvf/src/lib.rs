@@ -1,6 +1,8 @@
 // Copyright 2021 Red Hat, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(target_os = "macos")]
+
 #[allow(non_camel_case_types)]
 #[allow(improper_ctypes)]
 #[allow(dead_code)]
@@ -23,6 +25,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use arch::ArchMemoryInfo;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
 use log::debug;
@@ -91,7 +94,8 @@ const CNTHCTL_EL2_BITS: u64 = CNTHCTL_EL0VCTEN | CNTHCTL_EL0PCTEN;
 
 const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
 const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
-const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
+// ID_AA64PFR1_EL1.SME is the 4-bit field [27:24].
+const AA64PFR1_EL1_SMEMASK: u64 = 0xf << 24;
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
@@ -105,6 +109,10 @@ const EC_AA64_BKPT: u64 = 0x3c;
 pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
+    IpaGetDefault,
+    IpaGetMaximum,
+    IpaSet,
+    IpaTooLow,
     MemoryMap,
     MemoryUnmap,
     NestedCheck,
@@ -128,6 +136,13 @@ impl Display for Error {
         match self {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
+            IpaGetDefault => write!(f, "Error getting IPA default value"),
+            IpaGetMaximum => write!(f, "Error getting IPA maximum value"),
+            IpaSet => write!(f, "Error setting IPA value"),
+            IpaTooLow => write!(
+                f,
+                "The VM requires an IPA larger than the maximum supported in this system"
+            ),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
@@ -239,7 +254,7 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 });
 
 impl HvfVm {
-    pub fn new(nested_enabled: bool) -> Result<Self, Error> {
+    pub fn new(arch_mem_info: &mut ArchMemoryInfo, nested_enabled: bool) -> Result<Self, Error> {
         let config = unsafe { hv_vm_config_create() };
         if nested_enabled {
             let set_el2_enabled: libloading::Symbol<
@@ -254,6 +269,36 @@ impl HvfVm {
             if ret != HV_SUCCESS {
                 return Err(Error::EnableEL2);
             }
+        }
+
+        let mut ipa_size_default: u32 = 0;
+        let ret = unsafe { hv_vm_config_get_default_ipa_size(&mut ipa_size_default as *mut _) };
+        if ret != HV_SUCCESS {
+            return Err(Error::IpaGetDefault);
+        }
+
+        let mut ipa_size_max: u32 = 0;
+        let ret = unsafe { hv_vm_config_get_max_ipa_size(&mut ipa_size_max as *mut _) };
+        if ret != HV_SUCCESS {
+            return Err(Error::IpaGetMaximum);
+        }
+
+        let mut ipa_size = ipa_size_default;
+        // If the guest's last address is beyond the 64GB line, we need a 40-bit (or larger) IPA.
+        if arch_mem_info.guest_last_addr > 64 * 1024 * 1024 * 1024 {
+            if ipa_size_max < 40 {
+                return Err(Error::IpaTooLow);
+            }
+            ipa_size = ipa_size_max;
+        }
+
+        let ret = unsafe { hv_vm_config_set_ipa_size(config, ipa_size) };
+        if ret != HV_SUCCESS {
+            return Err(Error::IpaSet);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            arch_mem_info.ipa_size = ipa_size;
         }
 
         let ret = unsafe { hv_vm_create(config) };
@@ -305,6 +350,7 @@ pub enum VcpuExit<'a> {
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
     PsciHandled,
+    Reset,
     SecureMonitorCall,
     Shutdown,
     SystemRegister,
@@ -383,7 +429,45 @@ impl HvfVcpu<'_> {
         })
     }
 
-    pub fn set_initial_state(&self, entry_addr: u64, fdt_addr: u64) -> Result<(), Error> {
+    pub fn set_initial_state(
+        &self,
+        ipa_size: u32,
+        entry_addr: u64,
+        fdt_addr: u64,
+    ) -> Result<(), Error> {
+        // Set IPA size on MMFR0
+        let ipa_index: u8 = match ipa_size {
+            36 => 1,
+            40 => 2,
+            42 => 3,
+            44 => 4,
+            48 => 5,
+            52 => 6,
+            56 => 7,
+            _ => return Err(Error::VcpuInitialRegisters),
+        };
+        let mut val: u64 = 0;
+        let ret = unsafe {
+            hv_vcpu_get_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR0_EL1,
+                &mut val as *mut _,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
+        }
+        let ret = unsafe {
+            hv_vcpu_set_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR0_EL1,
+                (val & !0xf) | (ipa_index as u64),
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
+        }
+
         if self.nested_enabled {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL2_FAULT_BITS_64)
@@ -432,30 +516,6 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
-
-            // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
-            // break after enabling the MMU. Mask it out.
-            let mut val: u64 = 0;
-            let ret = unsafe {
-                hv_vcpu_get_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    &mut val as *mut _,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    val & !AA64PFR1_EL1_SMEMASK,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
         } else {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
@@ -463,6 +523,33 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
+        }
+
+        // Apple silicon from M4 on implements SME without SVE. A guest that sees
+        // SME in ID_AA64PFR1_EL1 uses it, and guest userspace assumes SVE comes
+        // with it: Chromium's SME path issues a non-streaming SVE instruction and
+        // takes a SIGILL. Under nested virtualization the same advertisement
+        // breaks the guest once it enables the MMU.
+        let mut val: u64 = 0;
+        let ret = unsafe {
+            hv_vcpu_get_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                &mut val as *mut _,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
+        }
+        let ret = unsafe {
+            hv_vcpu_set_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                val & !AA64PFR1_EL1_SMEMASK,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_PC, entry_addr) };
@@ -558,7 +645,7 @@ impl HvfVcpu<'_> {
                 Ok(VcpuExit::Shutdown)
             },
             0x8400_0009 /* QEMU_PSCI_0_2_FN_SYSTEM_RESET */ => {
-                Ok(VcpuExit::Shutdown)
+                Ok(VcpuExit::Reset)
             },
             0xc400_0003 /* QEMU_PSCI_0_2_FN64_CPU_ON */ => {
                 let mpidr = self.read_reg(hv_reg_t_HV_REG_X1)?;
@@ -659,6 +746,7 @@ impl HvfVcpu<'_> {
 
                     match len {
                         1 => self.mmio_buf[0..1].copy_from_slice(&(val as u8).to_le_bytes()),
+                        2 => self.mmio_buf[0..2].copy_from_slice(&(val as u16).to_le_bytes()),
                         4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
                         8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
                         _ => panic!("unsupported mmio len={len}"),
