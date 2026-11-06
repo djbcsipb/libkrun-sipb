@@ -7,6 +7,7 @@ mod exec;
 mod freebsd;
 #[cfg(target_os = "linux")]
 mod fs;
+#[cfg(target_os = "linux")]
 mod ssh;
 #[cfg(feature = "timesync")]
 mod timesync;
@@ -164,7 +165,10 @@ fn main() -> anyhow::Result<()> {
     timesync::run();
 
     let (pid_rx, pid_tx) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    #[cfg(target_os = "linux")]
     ssh::run(pid_rx);
+    #[cfg(not(target_os = "linux"))]
+    drop(pid_rx);
 
     exec::run_workload(&argv, pid_tx);
 }
