@@ -34,17 +34,55 @@ At startup, `init-binary`:
 - **OCI Spec Ingestion**: Provides `Builder::from_oci_json()` to convert standard container `config.json` specifications into guest initialization structures.
 - **FFI Bridge**: Exports the `libkrun_init` C ABI using ffier (`ffier::library_definition!("krun_init", ...)`).
 
+### Control channel for a running workload
+
+The optional Unix control channel lets a container runtime start another process in
+the guest or signal the main workload. Set `Builder::control_socket(path)` on
+the init configuration, then call `Config::apply_with_vsock(overlay, payload,
+vsock)` with the VM's `VsockDevice`. The call maps the configured host Unix
+socket to the guest init's vsock port. `Config::apply` returns an error when a
+control socket was configured without a vsock device. Keep the `Config` alive
+for the VM's lifetime, as with other overlay files. The channel is unavailable
+when `KRUN_INIT_PID1=1`, because that mode replaces init with the workload.
+Windows builds do not expose the control channel API.
+
+On the host, `Controller::open(path, timeout_ms)` waits for guest init to answer
+on that socket. `Controller::exec_pipes` starts a process with duplicated stdio
+descriptors; pass `None` for stdin to give the process immediate EOF.
+`Controller::exec_tty` starts it with a pseudo-terminal. Call `Process::wait`
+to relay stdio and receive the exit code. A signal self-pipe passed to `wait`
+forwards signals and terminal size changes. `Controller::signal_entrypoint`
+signals the main workload, including the `SIGTERM` used by a container stop
+request. Each operation uses a separate connection.
+
+Place the host socket in a private directory and restrict access to that
+directory. Any local process that can connect to the socket can request an
+exec in the guest; the default identity is guest root unless the request sets
+another UID and GID. The guest accepts the host vsock CID for this channel,
+and the VMM's TSI guard prevents guest-initiated connections to the mapped
+host listening socket. See [Security Model](security-model.md).
+
+The current relay writes guest output synchronously to the caller's stdout or
+stderr descriptor. If that consumer stops draining output, the relay also
+stops reading the control socket. Signal forwarding, including Ctrl-C, resumes
+when the consumer drains output. If the consumer closes the descriptor, the
+relay ends and the guest process receives SIGHUP.
+
+When terminal input reaches EOF, queued terminal input is discarded and the
+guest process receives SIGHUP. Pipe input is drained before EOF.
+
 ### 3. Cross-Crate Symbol Resolution
 
-When `krun-init-blob` is consumed as a standalone shared library (`libkrun_init.so`) or built with `feature = "ffi-client"`:
-- It interacts with `libkrun` without compile-time linkage by using foreign handle types (`FsOverlay`, `Payload`) from `krun-via-cdylib-weak`.
-- In `Config::apply`, `init-blob` dynamically resolves required `libkrun` functions (such as `krun_fs_overlay_add_file` and `krun_payload_append_cmdline`) from the process's global symbol table (`RTLD_DEFAULT`) using `krun_via_cdylib_weak::require()`.
-- Callers can also supply an explicit `dlopen` library handle via `Config::apply_in`.
-- When built with `feature = "direct"` (e.g. in-tree static Rust builds), `init-blob` links directly against `krun::FsOverlay` and `krun::Payload` types without dynamic symbol lookups.
+When `krun-init-blob` is consumed as a standalone shared library (`libkrun_init.so`) or built with `feature = "ffi"`:
+- It interacts with `libkrun` without compile-time linkage by using foreign handle types (`FsOverlay`, `Payload`) from `libkrun-via-libc`.
+- In `Config::apply`, `init-blob` dynamically resolves required `libkrun` functions (such as `krun_fs_overlay_add_file` and `krun_payload_append_cmdline`) from the process's global symbol table by default using `libkrun_via_libc::ffi::require()`.
+- When built with `feature = "krun"` (the default, e.g. in-tree static Rust builds), `init-blob` links directly against `krun::FsOverlay` and `krun::Payload` types without dynamic symbol lookups.
 
-### 4. `bindings/init-blob-via-cdylib` (Strongly Linked Rust Client)
+The `krun` and `ffi` backends are mutually exclusive; shared-library builds use `--no-default-features` to disable `krun`.
 
-Provides a Rust client linked against `libkrun_init.so`. The client code is generated at build time from `bindings/init-blob-via-cdylib/ffier-krun_init.json` using `ffier-gen-rust-client`. `libkrun_init.so` must be available at link time and runtime; the weak runtime symbol resolution described above applies to `libkrun` calls made by `init-blob`, not to this client.
+### 4. `bindings/init-blob-via-cdylib` (Rust Client)
+
+Provides a Rust client for `libkrun_init.so`, generated at build time from `bindings/init-blob-via-cdylib/ffier-krun_init.json` using `ffier-gen-rust-client`. With `ffier-strong`, the library must be available at link time and runtime; `ffier-dynlookup` resolves its symbols at runtime.
 
 ### 5. `init/aws-nitro` (AWS Nitro Enclaves Init)
 

@@ -170,5 +170,21 @@ fn main() -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     drop(pid_rx);
 
-    exec::run_workload(&argv, pid_tx);
+    #[cfg(target_os = "linux")]
+    let control_server = cfg.control_vsock_port.and_then(|port| {
+        if exec::workload_is_pid1() {
+            eprintln!("control server: not available when the workload runs as PID 1");
+            return None;
+        }
+        krun_init_common::server::Server::bind(port)
+            .inspect_err(|e| eprintln!("control server: {e}"))
+            .ok()
+    });
+
+    exec::run_workload(
+        &argv,
+        pid_tx,
+        #[cfg(target_os = "linux")]
+        control_server,
+    );
 }

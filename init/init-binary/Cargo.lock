@@ -856,6 +856,7 @@ dependencies = [
 name = "krun-init"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
+ "krun-init-common",
  "anyhow",
  "libc",
  "nix 0.30.1",
@@ -1992,3 +1993,28 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+dependencies = [
+ "serde",
+ "unty",
+]
+
+[[package]]
+name = "krun-init-common"
+version = "0.1.0-2.0.0-dev"
+dependencies = [
+ "bincode",
+ "libc",
+ "serde",
+]
+
+[[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"

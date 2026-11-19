@@ -216,7 +216,7 @@ impl server::Handler for Server {
             .and_then(|r| r.strip_prefix("KRUN_STOP "))
             .and_then(|s| s.trim().parse::<i32>().ok())
         {
-            if crate::exec::use_custom_pid1() {
+            if crate::exec::workload_is_pid1() {
                 // For some reason `poweroff` starts a shutdown but hangs at the end with
                 // "reboot: Power off not available: System halted instead",
                 // whereas `reboot` actually does a proper poweroff.

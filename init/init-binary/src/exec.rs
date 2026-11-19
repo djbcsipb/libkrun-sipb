@@ -80,15 +80,19 @@ pub fn set_exit_code(code: i32) {
 #[cfg(not(target_os = "linux"))]
 pub fn set_exit_code(_code: i32) {}
 
-/// Matches the C init which checked *env_init_pid1 == '1' (first-byte
-/// prefix), accepting "1", "10", "1\n", etc.  Exact equality with "1" would
-/// reject values that arrive with a trailing newline.
-pub fn use_custom_pid1() -> bool {
+// Match the C init which checked *env_init_pid1 == '1' (first-byte prefix),
+// accepting "1", "10", "1\n", etc.  Exact equality with "1" would reject
+// values that arrive with a trailing newline.
+pub fn workload_is_pid1() -> bool {
     env::var("KRUN_INIT_PID1").is_ok_and(|v| v.starts_with('1'))
 }
 
-pub fn run_workload(argv: &[String], pid_tx: OwnedFd) -> ! {
-    if use_custom_pid1() {
+pub fn run_workload(
+    argv: &[String],
+    pid_tx: OwnedFd,
+    #[cfg(target_os = "linux")] control_server: Option<krun_init_common::server::Server>,
+) -> ! {
+    if workload_is_pid1() {
         exec_workload(argv);
     }
 
@@ -100,6 +104,12 @@ pub fn run_workload(argv: &[String], pid_tx: OwnedFd) -> ! {
         Ok(ForkResult::Child) => exec_workload(argv),
         Ok(ForkResult::Parent { child }) => {
             let _ = unistd::write(&pid_tx, &child.as_raw().to_le_bytes());
+            #[cfg(target_os = "linux")]
+            if let Some(server) = control_server
+                && let Err(e) = server.start(child.as_raw())
+            {
+                eprintln!("control server: {e}");
+            }
             let code = loop {
                 match wait::waitpid(Some(child), None) {
                     Ok(WaitStatus::Exited(_, c)) => break c,

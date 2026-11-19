@@ -50,7 +50,12 @@ pub struct TsiStreamProxy {
     pub(crate) host_read_closed: bool,
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) pending_accepts: u64,
-    pub(crate) unixsock_path: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    unixsock_path: Option<unix::PinnedUnixPath>,
+    #[cfg(not(target_os = "linux"))]
+    unixsock_path: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    pub(crate) protected_unix_paths: Vec<PathBuf>,
     #[cfg(unix)]
     pub(crate) pending_tx: Vec<u8>,
 }
@@ -95,6 +100,8 @@ impl TsiStreamProxy {
             unixsock_path: None,
             #[cfg(unix)]
             pending_tx: Vec::new(),
+            #[cfg(target_os = "linux")]
+            protected_unix_paths: Vec::new(),
         })
     }
 
@@ -137,6 +144,8 @@ impl TsiStreamProxy {
             unixsock_path: None,
             #[cfg(unix)]
             pending_tx: Vec::new(),
+            #[cfg(target_os = "linux")]
+            protected_unix_paths: Vec::new(),
         }
     }
 
@@ -420,6 +429,7 @@ impl AsRawFd for TsiStreamProxy {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Drop for TsiStreamProxy {
     fn drop(&mut self) {
         if let Some(path) = &self.unixsock_path {
