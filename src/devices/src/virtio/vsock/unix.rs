@@ -10,10 +10,12 @@ use nix::sys::socket::{
     connect, listen, recv, send, shutdown, socket,
 };
 use std::collections::HashMap;
+use std::fs::{self, Permissions};
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::super::Queue as VirtQueue;
@@ -26,6 +28,18 @@ use super::proxy::{NewProxyType, Proxy, ProxyError, ProxyStatus, ProxyUpdate};
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
+
+/// Vsock port of the guest init exec server.
+const EXEC_SERVER_PORT: u32 = 0x6b72756e;
+
+/// Whoever can connect to this socket gets a root shell in the guest.
+fn restrict_exec_socket(path: &Path, port: u32) -> Result<(), Errno> {
+    if port != EXEC_SERVER_PORT {
+        return Ok(());
+    }
+    fs::set_permissions(path, Permissions::from_mode(0o600))
+        .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO)))
+}
 
 pub struct UnixProxy {
     id: u64,
@@ -639,6 +653,7 @@ impl UnixAcceptorProxy {
             &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
         )
         .map_err(ProxyError::CreatingSocket)?;
+        restrict_exec_socket(path, peer_port).map_err(ProxyError::CreatingSocket)?;
         listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
             .map_err(ProxyError::CreatingSocket)?;
         Ok(UnixAcceptorProxy { id, fd, peer_port })
@@ -717,5 +732,36 @@ impl Proxy for UnixAcceptorProxy {
 impl AsRawFd for UnixAcceptorProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mode_after_restrict(name: &str, port: u32) -> u32 {
+        let path = std::env::temp_dir().join(format!("krun-unix-{name}-{}", std::process::id()));
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        restrict_exec_socket(&path, port).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        fs::remove_file(&path).unwrap();
+        mode
+    }
+
+    #[test]
+    fn exec_port_socket_is_owner_only() {
+        assert_eq!(mode_after_restrict("exec", EXEC_SERVER_PORT), 0o600);
+    }
+
+    #[test]
+    fn other_ports_keep_their_mode() {
+        assert_eq!(mode_after_restrict("other", 1234), 0o644);
+    }
+
+    #[test]
+    fn missing_socket_is_an_error() {
+        let path = std::env::temp_dir().join("krun-unix-missing-socket");
+        assert!(restrict_exec_socket(&path, EXEC_SERVER_PORT).is_err());
     }
 }
