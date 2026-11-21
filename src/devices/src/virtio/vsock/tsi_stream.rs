@@ -37,6 +37,50 @@ use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
 
+#[derive(Default)]
+struct PendingTx {
+    buf: Vec<u8>,
+    shutdown_write_deferred: bool,
+}
+
+impl PendingTx {
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Returns false, leaving the queue untouched, if the peer ignored its send credit.
+    fn push(&mut self, data: &[u8]) -> bool {
+        if data.len() > defs::CONN_TX_BUF_SIZE - self.buf.len() {
+            return false;
+        }
+        self.buf.extend_from_slice(data);
+        true
+    }
+
+    fn consume(&mut self, sent: usize) {
+        self.buf.drain(..sent);
+    }
+
+    /// Returns true if the shutdown must wait until the queued data is flushed.
+    fn defer_shutdown_write(&mut self) -> bool {
+        self.shutdown_write_deferred = !self.buf.is_empty();
+        self.shutdown_write_deferred
+    }
+
+    /// Returns true once, when a deferred shutdown can finally be performed.
+    fn take_deferred_shutdown_write(&mut self) -> bool {
+        if self.buf.is_empty() && self.shutdown_write_deferred {
+            self.shutdown_write_deferred = false;
+            return true;
+        }
+        false
+    }
+}
+
 pub struct TsiStreamProxy {
     id: u64,
     cid: u64,
@@ -58,7 +102,7 @@ pub struct TsiStreamProxy {
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
     unixsock_path: Option<PathBuf>,
-    pending_tx: Vec<u8>,
+    pending_tx: PendingTx,
 }
 
 impl TsiStreamProxy {
@@ -139,7 +183,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
-            pending_tx: Vec::new(),
+            pending_tx: PendingTx::default(),
         })
     }
 
@@ -178,7 +222,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
-            pending_tx: Vec::new(),
+            pending_tx: PendingTx::default(),
         }
     }
 
@@ -429,6 +473,20 @@ impl TsiStreamProxy {
         evset
     }
 
+    fn reset_connection(&mut self, update: &mut ProxyUpdate) {
+        self.push_reset();
+        self.status = ProxyStatus::Closed;
+        update.signal_queue = true;
+        update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+        update.remove_proxy = ProxyRemoval::Deferred;
+    }
+
+    fn shutdown_socket(&self, how: Shutdown) {
+        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
+            warn!("error sending shutdown to socket: {e}");
+        }
+    }
+
     fn try_send(&mut self, update: &mut ProxyUpdate) {
         if !self.pending_tx.is_empty() {
             #[cfg(target_os = "macos")]
@@ -436,10 +494,13 @@ impl TsiStreamProxy {
             #[cfg(target_os = "linux")]
             let flags = MsgFlags::MSG_NOSIGNAL;
 
-            match send(self.fd.as_raw_fd(), &self.pending_tx, flags) {
+            match send(self.fd.as_raw_fd(), self.pending_tx.as_slice(), flags) {
                 Ok(sent) => {
-                    self.pending_tx.drain(..sent);
+                    self.pending_tx.consume(sent);
                     self.tx_cnt += Wrapping(sent as u32);
+                    if self.pending_tx.take_deferred_shutdown_write() {
+                        self.shutdown_socket(Shutdown::Write);
+                    }
                 }
                 Err(Errno::EWOULDBLOCK) => {}
                 Err(err) => {
@@ -447,11 +508,7 @@ impl TsiStreamProxy {
                         "error sending data to peer, closing connection: id={}, err={}",
                         self.id, err
                     );
-                    self.push_reset();
-                    self.status = ProxyStatus::Closed;
-                    update.signal_queue = true;
-                    update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
-                    update.remove_proxy = ProxyRemoval::Deferred;
+                    self.reset_connection(update);
                     return;
                 }
             }
@@ -648,7 +705,14 @@ impl Proxy for TsiStreamProxy {
             return update;
         };
 
-        self.pending_tx.extend_from_slice(buf);
+        if !self.pending_tx.push(buf) {
+            warn!(
+                "peer exceeded its send credit, closing connection: id={}",
+                self.id
+            );
+            self.reset_connection(&mut update);
+            return update;
+        }
         self.try_send(&mut update);
         update
     }
@@ -789,16 +853,11 @@ impl Proxy for TsiStreamProxy {
         let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
-        let how = if recv_off && send_off {
-            Shutdown::Both
-        } else if recv_off {
-            Shutdown::Read
-        } else {
-            Shutdown::Write
-        };
-
-        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
-            warn!("error sending shutdown to socket: {e}");
+        if recv_off {
+            self.shutdown_socket(Shutdown::Read);
+        }
+        if send_off && !self.pending_tx.defer_shutdown_write() {
+            self.shutdown_socket(Shutdown::Write);
         }
     }
 
@@ -921,5 +980,47 @@ impl Drop for TsiStreamProxy {
         if let Some(path) = &self.unixsock_path {
             _ = fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_rejects_data_beyond_credit() {
+        let mut tx = PendingTx::default();
+        assert!(tx.push(&vec![0u8; defs::CONN_TX_BUF_SIZE]));
+        assert!(!tx.push(&[1]));
+        assert_eq!(tx.as_slice().len(), defs::CONN_TX_BUF_SIZE);
+    }
+
+    #[test]
+    fn consume_frees_room() {
+        let mut tx = PendingTx::default();
+        assert!(tx.push(&vec![0u8; defs::CONN_TX_BUF_SIZE]));
+        tx.consume(10);
+        assert!(tx.push(&[0u8; 10]));
+        assert!(!tx.push(&[0u8; 1]));
+    }
+
+    #[test]
+    fn shutdown_write_is_immediate_when_nothing_queued() {
+        let mut tx = PendingTx::default();
+        assert!(!tx.defer_shutdown_write());
+        assert!(!tx.take_deferred_shutdown_write());
+    }
+
+    #[test]
+    fn shutdown_write_waits_for_queued_data() {
+        let mut tx = PendingTx::default();
+        assert!(tx.push(b"hello"));
+        assert!(tx.defer_shutdown_write());
+        assert!(!tx.take_deferred_shutdown_write());
+        tx.consume(3);
+        assert!(!tx.take_deferred_shutdown_write());
+        tx.consume(2);
+        assert!(tx.take_deferred_shutdown_write());
+        assert!(!tx.take_deferred_shutdown_write());
     }
 }
