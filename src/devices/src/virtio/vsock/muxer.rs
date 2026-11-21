@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -448,6 +450,15 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
+            if self.targets_listening_ipc_socket(&req.addr) {
+                warn!("refusing guest TSI listen on a host-side listening vsock port socket");
+                self.push_packet(MuxerRx::ListenResponse {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                    result: -libc::EADDRINUSE,
+                });
+                return;
+            }
             match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => self.process_proxy_update(
                     id,
@@ -734,8 +745,15 @@ impl VsockMuxer {
     }
 }
 
+/// The kernel ends a sockaddr_un path at the first NUL, but a guest can pad it with more.
+fn path_before_nul(path: &Path) -> &Path {
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Path::new(OsStr::from_bytes(&bytes[..end]))
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (fs::metadata(a), fs::metadata(b)) {
+    match (fs::metadata(a), fs::metadata(path_before_nul(b))) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     }
@@ -760,6 +778,10 @@ mod tests {
         assert!(same_file(&real, &link));
         assert!(!same_file(&real, &other));
         assert!(!same_file(&real, &dir.join("missing")));
+
+        let mut padded = real.as_os_str().as_bytes().to_vec();
+        padded.extend_from_slice(b"\0\0\0");
+        assert!(same_file(&real, Path::new(OsStr::from_bytes(&padded))));
 
         fs::remove_dir_all(&dir).unwrap();
     }
