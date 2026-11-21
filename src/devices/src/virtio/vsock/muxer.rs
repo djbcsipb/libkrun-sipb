@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::super::Queue as VirtQueue;
@@ -16,9 +18,10 @@ use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
-use super::tsi_stream::TsiStreamProxy;
+use super::tsi_stream::{TsiStreamProxy, path_before_nul};
 use super::unix::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
+use nix::sys::socket::SockaddrStorage;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -353,11 +356,30 @@ impl VsockMuxer {
         }
     }
 
+    fn targets_listening_ipc_socket(&self, addr: &SockaddrStorage) -> bool {
+        let Some(path) = addr.as_unix_addr().and_then(|a| a.path()) else {
+            return false;
+        };
+        self.unix_ipc_port_map.as_ref().is_some_and(|map| {
+            map.values()
+                .any(|(listen_path, listen)| *listen && same_file(listen_path, path))
+        })
+    }
+
     fn process_connect(&self, pkt: &VsockPacket) {
         debug!("proxy connect request");
         if let Some(req) = pkt.read_connect_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("proxy connect request: id={id}");
+            if self.targets_listening_ipc_socket(&req.addr) {
+                warn!("refusing guest TSI connection to a host-side listening vsock port socket");
+                self.push_packet(MuxerRx::ConnResponse {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                    result: -libc::ECONNREFUSED,
+                });
+                return;
+            }
             match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => {
                     self.process_proxy_update(id, proxy.lock().unwrap().connect(pkt, req));
@@ -426,6 +448,15 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
+            if self.targets_listening_ipc_socket(&req.addr) {
+                warn!("refusing guest TSI listen on a host-side listening vsock port socket");
+                self.push_packet(MuxerRx::ListenResponse {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                    result: -libc::EADDRINUSE,
+                });
+                return;
+            }
             match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => self.process_proxy_update(
                     id,
@@ -709,5 +740,52 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    let b = path_before_nul(b);
+    // Also match by name, so that deleting the socket cannot make the guard permissive.
+    if a == b {
+        return true;
+    }
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn same_file_follows_symlinks() {
+        let dir = std::env::temp_dir().join(format!("krun-muxer-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real");
+        let link = dir.join("link");
+        let other = dir.join("other");
+        fs::write(&real, b"").unwrap();
+        fs::write(&other, b"").unwrap();
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(same_file(&real, &link));
+        assert!(!same_file(&real, &other));
+        assert!(!same_file(&real, &dir.join("missing")));
+        assert!(same_file(&dir.join("missing"), &dir.join("missing")));
+
+        let mut padded = real.as_os_str().as_bytes().to_vec();
+        padded.extend_from_slice(b"\0\0\0");
+        assert!(same_file(&real, Path::new(OsStr::from_bytes(&padded))));
+
+        let mut interior = dir.join("real").as_os_str().as_bytes().to_vec();
+        interior.extend_from_slice(b"\0suffix");
+        assert!(same_file(&real, Path::new(OsStr::from_bytes(&interior))));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
