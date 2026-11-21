@@ -12,13 +12,25 @@ use tokio::{
     process::Command,
     sync::mpsc,
 };
-use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener};
+use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockListener};
 
 const PORT: u32 = 0x6b72756e;
 
 static WORKLOAD_PID: OnceLock<Pid> = OnceLock::new();
 
 pub fn run(pid_rx: OwnedFd) {
+    // The host is outside the trust boundary of a confidential guest, so exec is opt-in there.
+    #[cfg(any(feature = "amd-sev", feature = "tdx"))]
+    if std::env::var("KRUN_EXEC_SERVER").as_deref() != Ok("1") {
+        return;
+    }
+
+    // Bind before the workload starts so it cannot claim the port first.
+    let Ok(listener) = vsock::VsockListener::bind_with_cid_port(VMADDR_CID_ANY, PORT) else {
+        return;
+    };
+    let listener = unsafe { OwnedFd::from_raw_fd(listener.into_raw_fd()) };
+
     match unsafe { unistd::fork() } {
         Ok(ForkResult::Child) => {
             // Detach immediately so getty doesn't kill us
@@ -30,7 +42,7 @@ pub fn run(pid_rx: OwnedFd) {
             else {
                 unsafe { libc::_exit(1) };
             };
-            let _ = rt.block_on(serve());
+            let _ = rt.block_on(serve(listener));
             unsafe { libc::_exit(1) };
         }
         _ => {
@@ -48,7 +60,7 @@ fn spawn_pid_receiver(pid_rx: OwnedFd) {
     });
 }
 
-async fn serve() -> anyhow::Result<()> {
+async fn serve(listener: OwnedFd) -> anyhow::Result<()> {
     let config = Arc::new(russh::server::Config {
         keys: vec![russh::keys::PrivateKey::random(
             &mut rand::rng(),
@@ -60,7 +72,8 @@ async fn serve() -> anyhow::Result<()> {
         inactivity_timeout: None,
         ..Default::default()
     });
-    let vsl = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, PORT))?;
+    // Safe because we own the fd, which is a bound and listening vsock socket.
+    let vsl = unsafe { VsockListener::from_raw_fd(listener.into_raw_fd()) };
     loop {
         let (socket, addr) = vsl.accept().await?;
         // Ensure connection is from the host.
