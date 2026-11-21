@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -75,7 +76,11 @@ async fn serve(listener: OwnedFd) -> anyhow::Result<()> {
     // Safe because we own the fd, which is a bound and listening vsock socket.
     let vsl = unsafe { VsockListener::from_raw_fd(listener.into_raw_fd()) };
     loop {
-        let (socket, addr) = vsl.accept().await?;
+        // Returning here would free the port for the workload to claim.
+        let Ok((socket, addr)) = vsl.accept().await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
         // Ensure connection is from the host.
         if addr.cid() != VMADDR_CID_HOST {
             continue;
