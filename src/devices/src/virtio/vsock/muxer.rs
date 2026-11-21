@@ -20,7 +20,7 @@ use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
-use super::tsi_stream::TsiStreamProxy;
+use super::tsi_stream::{TsiStreamProxy, path_before_nul};
 use super::unix::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
 use nix::sys::socket::SockaddrStorage;
@@ -745,15 +745,13 @@ impl VsockMuxer {
     }
 }
 
-/// The kernel ends a sockaddr_un path at the first NUL, but a guest can pad it with more.
-fn path_before_nul(path: &Path) -> &Path {
-    let bytes = path.as_os_str().as_bytes();
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    Path::new(OsStr::from_bytes(&bytes[..end]))
-}
-
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (fs::metadata(a), fs::metadata(path_before_nul(b))) {
+    let b = path_before_nul(b);
+    // Also match by name, so that deleting the socket cannot make the guard permissive.
+    if a == b {
+        return true;
+    }
+    match (fs::metadata(a), fs::metadata(b)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     }
@@ -778,10 +776,15 @@ mod tests {
         assert!(same_file(&real, &link));
         assert!(!same_file(&real, &other));
         assert!(!same_file(&real, &dir.join("missing")));
+        assert!(same_file(&dir.join("missing"), &dir.join("missing")));
 
         let mut padded = real.as_os_str().as_bytes().to_vec();
         padded.extend_from_slice(b"\0\0\0");
         assert!(same_file(&real, Path::new(OsStr::from_bytes(&padded))));
+
+        let mut interior = dir.join("real").as_os_str().as_bytes().to_vec();
+        interior.extend_from_slice(b"\0suffix");
+        assert!(same_file(&real, Path::new(OsStr::from_bytes(&interior))));
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +81,14 @@ impl PendingTx {
         }
         false
     }
+}
+
+/// The kernel ends a sockaddr_un path at the first NUL, but SockaddrStorage keeps whatever the
+/// guest padded it with. Every check and unlink must see the same file the kernel would.
+pub(super) fn path_before_nul(path: &Path) -> &Path {
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Path::new(OsStr::from_bytes(&bytes[..end]))
 }
 
 pub struct TsiStreamProxy {
@@ -545,20 +555,21 @@ impl TsiStreamProxy {
     }
 
     fn get_unixsock_path(&self, addr: &SockaddrStorage) -> Option<PathBuf> {
+        if self.family != AddressFamily::Unix {
+            return None;
+        }
+
         if let Some(addr) = addr.as_unix_addr()
             && let Some(path) = addr.path()
         {
-            // SockaddrStorage doesn't clean up NULLs. This is fine when
-            // using addr with other nix methods, but we need to clean them
-            // up to be able to treat it as a path with other Rust crates.
-            let path_str = path.to_str()?.replace("\0", "");
-            debug!("unix socket path_str={path_str}");
+            let path = path_before_nul(path);
+            debug!("unix socket path={path:?}");
 
-            match fs::metadata(&path_str) {
+            match fs::metadata(path) {
                 Ok(metadata) => {
                     if metadata.file_type().is_socket() {
                         debug!("unix socket path is socket");
-                        return PathBuf::from_str(&path_str).ok();
+                        return Some(path.to_path_buf());
                     } else {
                         debug!("unix socket path is NOT a socket");
                     }
@@ -986,6 +997,15 @@ impl Drop for TsiStreamProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_before_nul_cuts_at_first_nul() {
+        assert_eq!(path_before_nul(Path::new("/a/b")), Path::new("/a/b"));
+        let padded = Path::new(OsStr::from_bytes(b"/a/b\0\0"));
+        assert_eq!(path_before_nul(padded), Path::new("/a/b"));
+        let interior = Path::new(OsStr::from_bytes(b"/a/b\0c"));
+        assert_eq!(path_before_nul(interior), Path::new("/a/b"));
+    }
 
     #[test]
     fn push_rejects_data_beyond_credit() {
