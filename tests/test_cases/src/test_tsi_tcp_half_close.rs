@@ -25,21 +25,12 @@ mod host {
     use std::thread;
     use std::time::Instant;
 
-    use crate::common::{build_init_config, init_krun, setup_standard_devices};
-    use crate::{ShouldRun, Test, TestSetup};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunVsockDeviceNew,
-                krun::Symbol::KrunVsockDeviceDestroy,
-                krun::Symbol::KrunVsockDeviceAddPortForward,
-            ],
-        )
-    }
+    use crate::common::setup_fs_and_enter;
+    use crate::{Test, TestSetup, krun_call, krun_call_u32};
+    use krun_sys::*;
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::ptr::null;
 
     fn connect_ready() -> anyhow::Result<TcpStream> {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, DATA_PORT);
@@ -115,14 +106,6 @@ mod host {
     }
 
     impl Test for TestTsiTcpHalfClose {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
-                return ShouldRun::No("feature not enabled in this libkrun build");
-            }
-            ShouldRun::Yes
-        }
-
         fn timeout_secs(&self) -> u64 {
             20
         }
@@ -130,38 +113,30 @@ mod host {
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             thread::spawn(report_result);
 
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
+            unsafe {
+                krun_call!(krun_init_log(
+                    KRUN_LOG_TARGET_DEFAULT,
+                    KRUN_LOG_LEVEL_TRACE,
+                    KRUN_LOG_STYLE_AUTO,
+                    0
+                ))?;
+                let ctx = krun_call_u32!(krun_create_ctx())?;
+                let data_mapping = CString::new(format!("{DATA_PORT}:{DATA_PORT}")).unwrap();
+                let status_mapping = CString::new(format!("{STATUS_PORT}:{STATUS_PORT}")).unwrap();
+                let port_map = [data_mapping.as_ptr(), status_mapping.as_ptr(), null()];
 
-            let init_config = build_init_config(&test_setup.test_case, &[]);
-            let stdin = std::io::stdin();
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let (mut devices, payload) =
-                setup_standard_devices(&test_setup, &init_config, &stdin, &stdout, &stderr)?;
-            let mut vsock = krun::VsockDevice::new(3, krun::TsiFlags::HIJACK_INET)
-                .map_err(|error| anyhow::anyhow!("VsockDevice: {error:?}"))?;
-            vsock
-                .add_port_forward(&format!("{DATA_PORT}:{DATA_PORT}"))
-                .map_err(|error| anyhow::anyhow!("add_port_forward: {error:?}"))?;
-            vsock
-                .add_port_forward(&format!("{STATUS_PORT}:{STATUS_PORT}"))
-                .map_err(|error| anyhow::anyhow!("add_port_forward: {error:?}"))?;
-            devices.add(vsock);
-
-            let vmm = krun::VmmBuilder::new()
-                .vcpus(1)
-                .map_err(|error| anyhow::anyhow!("vcpus: {error:?}"))?
-                .ram_mib(512)
-                .map_err(|error| anyhow::anyhow!("ram_mib: {error:?}"))?
-                .payload(payload)
-                .devices(devices)
-                .build()
-                .map_err(|error| anyhow::anyhow!("build: {error:?}"))?;
-
-            vmm.run();
-            unreachable!()
+                krun_call!(krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET))?;
+                krun_call!(krun_set_port_map(ctx, port_map.as_ptr()))?;
+                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
+                krun_call!(krun_add_virtio_console_default(
+                    ctx,
+                    std::io::stdin().as_raw_fd(),
+                    std::io::stdout().as_raw_fd(),
+                    std::io::stderr().as_raw_fd(),
+                ))?;
+                setup_fs_and_enter(ctx, test_setup)?;
+            }
+            Ok(())
         }
     }
 }
