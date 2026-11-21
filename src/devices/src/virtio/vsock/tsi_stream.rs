@@ -8,7 +8,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]

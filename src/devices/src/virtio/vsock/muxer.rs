@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -760,6 +758,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn same_file_follows_symlinks() {
